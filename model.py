@@ -193,7 +193,8 @@ class Net(nn.Module):
     """
     The main model with dynamic positional encoding generation, optimized for classification.
     """
-    def __init__(self, img_size=32, patch_sizes=(2, 4, 8), embed_dim=256, num_heads=8, mlp_dim=512, num_layers=6, num_classes=10):
+    # def __init__(self, img_size=32, patch_sizes=(2, 4, 8), embed_dim=256, num_heads=8, mlp_dim=512, num_layers=6, num_classes=10):
+    def __init__(self, img_size=224, patch_sizes=(4, 8, 16), embed_dim=256, num_heads=8, mlp_dim=512, num_layers=6, num_classes=1000):
         super(Net, self).__init__()
         self.patch_embedding = AdaptivePatchEmbedding(img_size, patch_sizes, embed_dim)
         self.embed_dim = embed_dim
