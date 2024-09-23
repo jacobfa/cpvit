@@ -15,8 +15,7 @@ from torch.utils.data import DataLoader
 from model import Net
 from torch.cuda.amp import GradScaler
 import torch.nn.utils
-import matplotlib.pyplot as plt  # 1. Import Matplotlib
-
+    
 # Set up logger
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -40,11 +39,20 @@ def save_model(output_dir, model, epoch):
 def simple_accuracy(preds, labels):
     return (preds == labels).mean() * 100
 
+import torch
+
 def top_5_accuracy(output, target):
     """
     Compute the top-5 accuracy for classification tasks using model outputs.
+
+    Parameters:
+    output (torch.Tensor or numpy.ndarray): Raw model outputs (logits) of shape (n_samples, n_classes).
+    target (torch.Tensor or numpy.ndarray): True labels of shape (n_samples,).
+
+    Returns:
+    float: Top-5 accuracy score as a percentage.
     """
-    # [Function implementation remains unchanged]
+    # Convert output and target to tensors if they are not already
     if isinstance(output, torch.Tensor):
         logits = output.detach()
     else:
@@ -55,28 +63,50 @@ def top_5_accuracy(output, target):
     else:
         targets = torch.tensor(target)
 
+    # Ensure logits are floating-point tensors
     if not logits.is_floating_point():
         logits = logits.float()
 
+    # Ensure targets are of type Long for comparison
     if targets.dtype != torch.long:
         targets = targets.long()
 
-    with torch.no_grad():
-        if logits.dim() == 1:
-            logits = logits.unsqueeze(0)
-            targets = targets.unsqueeze(0)
 
+    with torch.no_grad():
+        # Handle 1D output (e.g., batch size of 1)
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)  # Shape: [1, n_classes]
+            targets = targets.unsqueeze(0)  # Shape: [1]
+
+        # Ensure logits have two dimensions: [batch_size, n_classes]
         if logits.dim() != 2:
             raise ValueError(f"Expected logits to be 2D, but got {logits.dim()}D")
 
-        top5_preds = torch.topk(logits, k=5, dim=1).indices
-        targets_expanded = targets.view(-1, 1)
-        correct = top5_preds.eq(targets_expanded)
-        correct_any = correct.any(dim=1).float()
+        # **Removed Softmax:** Not needed for top-k accuracy
+        # logits = torch.nn.functional.softmax(logits, dim=1)
+
+        # Get the indices of the top 5 predictions for each sample
+        # torch.topk returns a tuple (values, indices); we take indices
+        top5_preds = torch.topk(logits, k=5, dim=1).indices  # Shape: [batch_size, 5]
+
+        # Expand targets to compare with top5_preds
+        # targets.view(-1, 1) reshapes targets to [batch_size, 1]
+        # This allows broadcasting when comparing with top5_preds
+        targets_expanded = targets.view(-1, 1)  # Shape: [batch_size, 1]
+
+        # Check if the true label is among the top 5 predictions
+        correct = top5_preds.eq(targets_expanded)  # Shape: [batch_size, 5]
+
+
+        # For each sample, check if any of the top 5 predictions is correct
+        correct_any = correct.any(dim=1).float()  # Shape: [batch_size]
+
+        # Compute the top-5 accuracy as the mean of correct predictions
         top5_accuracy = correct_any.mean().item() * 100.0
 
         return top5_accuracy
 
+    
 class AverageMeter:
     """
     Computes and stores the average and current value.
@@ -121,41 +151,20 @@ def validate(model, val_loader, device):
     logger.info(f"Validation Accuracy: {accuracy:.4f}%, Validation Loss: {eval_losses.avg:.4f}, Top-5 Accuracy: {top5:.4f}%")
     return accuracy, top5
 
-# 2. Define the plotting function
-def plot_validation_accuracy(accuracies, output_dir):
-    plt.figure(figsize=(10, 6))
-    epochs = range(1, len(accuracies) + 1)
-    plt.plot(epochs, accuracies, 'b-', marker='o', label='Validation Accuracy')
-    plt.title('Validation Accuracy vs. Epoch')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy (%)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plot_path = os.path.join(output_dir, 'validation_accuracy.png')
-    plt.savefig(plot_path)
-    plt.close()
-    logger.info(f"Validation accuracy plot saved at {plot_path}")
-
 # Training function
 def train_ddp(rank, world_size):
     # Initialize the process group
     dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
-    print(f"Rank {rank} initialized")
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
 
     set_seed(42)  # Set a fixed seed for reproducibility
 
     # Set hyperparameters
-    batch_size = 64
+    batch_size = 8
     num_epochs = 350       
-    learning_rate = 2e-3 / world_size 
+    learning_rate = 0.001 / world_size 
     output_dir = './output'
-
-    # Create output directory if it doesn't exist
-    if rank == 0 and not os.path.exists(output_dir):
-        os.makedirs(output_dir)
 
     # Model setup
     model = Net(num_classes=1000).to(device)  # ImageNet has 1000 classes
@@ -179,12 +188,10 @@ def train_ddp(rank, world_size):
     transform_cifar = transforms.Compose([
         transforms.ToTensor()
     ])
-    print("Loading data")
-    
-    train_dataset = datasets.ImageNet(root='/home/ubuntu/ImageNet/', split='train', transform=transform)
-    val_dataset = datasets.ImageNet(root='/home/ubuntu/ImageNet/', split='val', transform=transform_test)
 
-    print("Data loaded")
+    train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
+    val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform_test)
+
     # train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
     # val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_cifar)
     
@@ -213,11 +220,8 @@ def train_ddp(rank, world_size):
     if rank == 0:
         writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
     
-    # Open a log file (only on rank 0)
-    if rank == 0:
-        file = open(os.path.join(output_dir, "log.txt"), "w")
-        val_accuracies = []  # 3. Initialize a list to store validation accuracies
-
+    file = open("log.txt", "w")
+    
     # Training loop
     for epoch in range(num_epochs):
         model.train()
@@ -245,26 +249,22 @@ def train_ddp(rank, world_size):
         # Validation
         accuracy, accuracy5 = validate(model, val_loader, device)
 
-        # TensorBoard writer and logging (only on rank 0)
+        # TensorBoard writer
         if rank == 0:
             writer.add_scalar('Loss/train', running_loss / len(train_loader), epoch+1)
             writer.add_scalar('Accuracy/val', accuracy, epoch+1)
             logger.info(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}")
             file.write(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}\n")
             file.flush()
-            val_accuracies.append(accuracy)  # 4. Collect validation accuracy
-            
-        # Save checkpoint every 3 epochs
+        
+        # Save checkpoint every 5 epochs
         if (epoch) % 3 == 0:
             save_model(output_dir, model, epoch+1)
-
+    
         scheduler.step()
-
+ 
     if rank == 0: 
         writer.close()
-        file.close()
-        # 5. Plot validation accuracy after training
-        plot_validation_accuracy(val_accuracies, output_dir)
 
     dist.destroy_process_group()
 
@@ -272,7 +272,6 @@ def train_ddp(rank, world_size):
 def main():
     world_size = torch.cuda.device_count()
     rank = int(os.environ['RANK'])  # rank should be set by distributed launcher
-    print(f"Rank: {rank}, World Size: {world_size}")
     train_ddp(rank, world_size)
 
 if __name__ == "__main__":
