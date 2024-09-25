@@ -13,9 +13,9 @@ from torchvision import datasets, transforms
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from model import Net
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 import torch.nn.utils
-
+    
 # Set up logger
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -28,47 +28,31 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-# Function to save the model's state_dict
+# Function to save the model
 def save_model(output_dir, model, epoch):
     model_to_save = model.module if hasattr(model, 'module') else model
     model_checkpoint = os.path.join(output_dir, f"checkpoint_epoch_{epoch}.pth")
     torch.save(model_to_save.state_dict(), model_checkpoint)
     logger.info(f"Model checkpoint saved at {model_checkpoint}")
 
-# Function to save the entire training checkpoint
-def save_training_checkpoint(output_dir, model, optimizer, scheduler, scaler, epoch):
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'scaler_state_dict': scaler.state_dict()
-    }
-    checkpoint_path = os.path.join(output_dir, 'training_checkpoint.pth')
-    torch.save(checkpoint, checkpoint_path)
-    logger.info(f"Training checkpoint saved at {checkpoint_path}")
 
-# Function to load the entire training checkpoint
-def load_training_checkpoint(output_dir, model, optimizer, scheduler, scaler, device):
-    checkpoint_path = output_dir
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        logger.info(f"Loaded checkpoint '{checkpoint_path}' (epoch {checkpoint['epoch']})")
-        return start_epoch
+def load_checkpoint(model, checkpoint_path):
+    if os.path.isfile(checkpoint_path):
+        logger.info(f"Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint)
+        logger.info("Checkpoint loaded successfully.")
+        
     else:
-        logger.info("No training checkpoint found, starting from scratch.")
-        return 0
+        logger.info(f"No checkpoint found at: {checkpoint_path}")
+    return model
 
-# Function to calculate simple accuracy
+# Function to calculate accuracy
 def simple_accuracy(preds, labels):
     return (preds == labels).mean() * 100
 
-# Function to calculate top-5 accuracy
+import torch
+
 def top_5_accuracy(output, target):
     """
     Compute the top-5 accuracy for classification tasks using model outputs.
@@ -99,6 +83,7 @@ def top_5_accuracy(output, target):
     if targets.dtype != torch.long:
         targets = targets.long()
 
+
     with torch.no_grad():
         # Handle 1D output (e.g., batch size of 1)
         if logits.dim() == 1:
@@ -124,6 +109,7 @@ def top_5_accuracy(output, target):
         # Check if the true label is among the top 5 predictions
         correct = top5_preds.eq(targets_expanded)  # Shape: [batch_size, 5]
 
+
         # For each sample, check if any of the top 5 predictions is correct
         correct_any = correct.any(dim=1).float()  # Shape: [batch_size]
 
@@ -132,7 +118,7 @@ def top_5_accuracy(output, target):
 
         return top5_accuracy
 
-# AverageMeter class to track metrics
+    
 class AverageMeter:
     """
     Computes and stores the average and current value.
@@ -177,7 +163,7 @@ def validate(model, val_loader, device):
     logger.info(f"Validation Accuracy: {accuracy:.4f}%, Validation Loss: {eval_losses.avg:.4f}, Top-5 Accuracy: {top5:.4f}%")
     return accuracy, top5
 
-# Training function with DDP and checkpointing
+# Training function
 def train_ddp(rank, world_size):
     # Initialize the process group
     dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
@@ -187,23 +173,23 @@ def train_ddp(rank, world_size):
     set_seed(42)  # Set a fixed seed for reproducibility
 
     # Set hyperparameters
-    batch_size = 32
+    batch_size = 64
     num_epochs = 350       
-    learning_rate = 0.001 / world_size 
+    learning_rate = 5e-3 / world_size 
     output_dir = './output'
 
-    # Create output directory if it doesn't exist
-    if rank == 0:
-        os.makedirs(output_dir, exist_ok=True)
-
     # Model setup
-    model = Net(num_classes=1000).to(device)  # ImageNet has 1000 classes
+    # model = Net(num_classes=1000).to(device)  # ImageNet has 1000 classes
+    model = load_checkpoint(Net(num_classes=1000).to(device), "./output/checkpoint_epoch_1.pth")
     model = DDP(model, device_ids=[rank])
 
     # Data augmentation and normalization for ImageNet
     transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(224, padding=4),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -216,15 +202,23 @@ def train_ddp(rank, world_size):
     ])
     
     transform_cifar = transforms.Compose([
-        transforms.ToTensor()
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32, padding=4),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
     ])
 
-    print("Loading ImageNet dataset")
-    train_dataset = datasets.ImageNet(root='/home/ubuntu/ImageNet/', split='train', transform=transform)
-    val_dataset = datasets.ImageNet(root='/home/ubuntu/ImageNet/', split='val', transform=transform_test)
-    print("ImageNet dataset loaded")
+    transform_test_cifar = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+    ])
+
+    train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
+    val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform_test)
+
     # train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
-    # val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_cifar)
+    # val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_test_cifar)
     
     # Sampler and DataLoader
     train_sampler = DistributedSampler(train_dataset)
@@ -236,7 +230,7 @@ def train_ddp(rank, world_size):
     # Loss, optimizer, and scheduler
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=80, gamma=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 
     # Mixed Precision Scaler
     scaler = GradScaler()
@@ -251,24 +245,10 @@ def train_ddp(rank, world_size):
     if rank == 0:
         writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
     
-    # Open a log file (only for rank 0)
-    if rank == 0:
-        file = open(os.path.join(output_dir, "log.txt"), "a")
-
-    # Initialize start_epoch
-    start_epoch = 0
-
-    # Load checkpoint if it exists (only for rank 0)
-    if rank == 0:
-        checkpoint_path = os.path.join(output_dir, 'checkpoint_epoch_1.pth')
-        start_epoch = load_training_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, device)
-    # Broadcast start_epoch to all processes
-    start_epoch = torch.tensor(start_epoch).to(device)
-    dist.broadcast(start_epoch, src=0)
-    start_epoch = start_epoch.item()
-
+    file = open("log.txt", "w")
+    
     # Training loop
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(num_epochs):
         model.train()
         train_sampler.set_epoch(epoch)
         running_loss = 0.0
@@ -277,16 +257,12 @@ def train_ddp(rank, world_size):
             inputs, labels = inputs.to(device), labels.to(device)
 
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast():
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
 
             total_loss = loss
             # Backward pass with gradient scaling for mixed precision
             scaler.scale(total_loss).backward()
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
             # Update weights
             scaler.step(optimizer)
             scaler.update()
@@ -298,29 +274,22 @@ def train_ddp(rank, world_size):
         # Validation
         accuracy, accuracy5 = validate(model, val_loader, device)
 
-        # TensorBoard writer and logging (only for rank 0)
+        # TensorBoard writer
         if rank == 0:
             writer.add_scalar('Loss/train', running_loss / len(train_loader), epoch+1)
             writer.add_scalar('Accuracy/val', accuracy, epoch+1)
-            writer.add_scalar('Top5_Accuracy/val', accuracy5, epoch+1)
-            logger.info(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}, Accuracy: {accuracy:.4f}%, Top5: {accuracy5:.4f}%")
-            file.write(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}, Accuracy: {accuracy:.4f}%, Top5: {accuracy5:.4f}%\n")
+            logger.info(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}")
+            file.write(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}\n")
             file.flush()
         
-        # Save model checkpoint every 3 epochs (only for rank 0)
-        if rank == 0 and (epoch + 1) % 3 == 0:
+        # Save checkpoint every 5 epochs
+        if (epoch) % 2 == 0:
             save_model(output_dir, model, epoch+1)
-        
-        # Save training checkpoint every epoch (only for rank 0)
-        if rank == 0:
-            save_training_checkpoint(output_dir, model, optimizer, scheduler, scaler, epoch+1)
     
         scheduler.step()
  
-    # Close TensorBoard writer and log file (only for rank 0)
-    if rank == 0:
+    if rank == 0: 
         writer.close()
-        file.close()
 
     dist.destroy_process_group()
 
@@ -332,3 +301,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
