@@ -49,7 +49,7 @@ class MultiScalePatchEmbedding(nn.Module):
             if H_k == self.H_max and W_k == self.W_max:
                 embeddings_aligned.append(embeddings)  # [B, D, H_max, W_max]
             else:
-                # Expand embeddings to [B, D, H_max, W_max]
+                # Expand embeddings to [B, D, H_max, W_max] by replicating
                 factor_H = self.H_max // H_k
                 factor_W = self.W_max // W_k
 
@@ -90,18 +90,6 @@ class GatedEmbeddingSelection(nn.Module):
         x = g * x  # [B, N_max, D]
         return x
 
-class SelfAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads):
-        super(SelfAttention, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads)
-
-    def forward(self, x):
-        # x: [B, N_max, D]
-        x = x.transpose(0, 1)  # [N_max, B, D]
-        attn_output, _ = self.attention(x, x, x)
-        x = attn_output.transpose(0, 1)  # [B, N_max, D]
-        return x
-
 class PositionalEncoding2D(nn.Module):
     def __init__(self, embed_dim, height, width):
         super(PositionalEncoding2D, self).__init__()
@@ -132,20 +120,39 @@ class PositionalEncoding2D(nn.Module):
         x = x + self.pe.unsqueeze(0).to(x.device)  # [B, N_max, D]
         return x
 
+class SelfAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super(SelfAttention, self).__init__()
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads)
+
+    def forward(self, x):
+        # x: [B, N_max, D]
+        x = x.transpose(0, 1)  # [N_max, B, D]
+        attn_output, _ = self.attention(x, x, x)
+        x = attn_output.transpose(0, 1)  # [B, N_max, D]
+        return x
+
 class Net(nn.Module):
     # def __init__(
-    #    self,
+    #     self,
     #     img_size=32,
     #     patch_sizes=[4, 8],
     #     in_channels=3,
     #     num_classes=10,
     #     embed_dim=64,
-    #     num_heads=4 
+    #     num_heads=4
     # ):
     
-    def __init__(self, img_size=224, patch_sizes=[8, 16, 32], in_channels=3, num_classes=1000, embed_dim=768, num_heads=12):
-    # def __init__(self, img_size=224, patch_sizes=[8, 16, 32], in_channels=3, num_classes=1000, embed_dim=1024, num_heads=16):
-    # def __init__(self, img_size=224, patch_sizes=[8, 16, 32], in_channels=3, num_classes=1000, embed_dim=1280, num_heads=16):
+    def __init__(
+        self,
+        img_size=224,
+        patch_sizes=[8, 16, 32],
+        in_channels=3,
+        num_classes=1000,
+        embed_dim=768,
+        num_heads=12
+    ):
+        
         super(Net, self).__init__()
         self.embed_dim = embed_dim
         self.num_classes = num_classes
@@ -178,11 +185,11 @@ class Net(nn.Module):
     def forward(self, x):
         # x: [B, C, H, W]
         x = self.patch_embedding(x)            # [B, N_max, K*D]
-        x = self.projection(x)                # [B, N_max, D]
-        x = self.gated_embedding(x)           # [B, N_max, D]
-        x = self.positional_encoding(x)       # [B, N_max, D]
-        x = self.self_attention(x)            # [B, N_max, D]
-        x = self.layer_norm(x)                # [B, N_max, D]
-        x = x.mean(dim=1)                     # Global average pooling [B, D]
-        x = self.classifier(x)                # [B, num_classes]
+        x = self.projection(x)                 # [B, N_max, D]
+        x = self.gated_embedding(x)            # [B, N_max, D]
+        x = self.positional_encoding(x)        # [B, N_max, D]
+        x = self.self_attention(x)             # [B, N_max, D]
+        x = self.layer_norm(x)                 # [B, N_max, D]
+        x = x.mean(dim=1)                      # Global average pooling [B, D]
+        x = self.classifier(x)                 # [B, num_classes]
         return x
