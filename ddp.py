@@ -1,304 +1,154 @@
-import os
-import random
-import numpy as np
-import logging
 import torch
-import torch.distributed as dist
-import torch.optim as optim
 import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-from torchvision import datasets, transforms
-from tqdm import tqdm
-from torch.utils.data import DataLoader
-from model import Net
-from torch.cuda.amp import GradScaler
-import torch.nn.utils
-    
-# Set up logger
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+import torch.nn.functional as F
+import math
 
-# Set random seed for reproducibility
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+class AdaptivePatchEmbedding(nn.Module):
+    def __init__(self, img_size=32, patch_sizes=[4, 8], in_channels=3, embed_dim=64):
+        super(AdaptivePatchEmbedding, self).__init__()
+        self.img_size = img_size
+        self.patch_sizes = patch_sizes
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
 
-# Function to save the model
-def save_model(output_dir, model, epoch):
-    model_to_save = model.module if hasattr(model, 'module') else model
-    model_checkpoint = os.path.join(output_dir, f"checkpoint_epoch_{epoch}.pth")
-    torch.save(model_to_save.state_dict(), model_checkpoint)
-    logger.info(f"Model checkpoint saved at {model_checkpoint}")
+        self.projections = nn.ModuleList()
+        # Initialize projections for different patch sizes
+        for p in patch_sizes:
+            proj = nn.Conv2d(in_channels, embed_dim, kernel_size=p, stride=p)
+            self.projections.append(proj)
 
+        # Initialize alpha parameter for weighting embeddings
+        self.alpha = nn.Parameter(torch.zeros(len(patch_sizes)))
 
-def load_checkpoint(model, checkpoint_path):
-    if os.path.isfile(checkpoint_path):
-        logger.info(f"Loading checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint)
-        logger.info("Checkpoint loaded successfully.")
-        
-    else:
-        logger.info(f"No checkpoint found at: {checkpoint_path}")
-    return model
+    def forward(self, x):
+        batch_size = x.size(0)
+        embeddings = []
+        num_patches_list = []
 
-# Function to calculate accuracy
-def simple_accuracy(preds, labels):
-    return (preds == labels).mean() * 100
+        # Extract embeddings for each patch size
+        for proj in self.projections:
+            e = proj(x)  # Shape: [B, D, H_p, W_p]
+            e = e.flatten(2).transpose(1, 2)  # Shape: [B, N_p, D]
+            embeddings.append(e)
+            num_patches_list.append(e.size(1))
 
-import torch
+        max_num_patches = max(num_patches_list)
 
-def top_5_accuracy(output, target):
-    """
-    Compute the top-5 accuracy for classification tasks using model outputs.
+        # Pad embeddings to have the same sequence length
+        padded_embeddings = []
+        for e in embeddings:
+            pad_length = max_num_patches - e.size(1)
+            if pad_length > 0:
+                padding = torch.zeros(e.size(0), pad_length, e.size(2), device=e.device, dtype=e.dtype)
+                e = torch.cat([e, padding], dim=1)  # Shape: [B, N_max, D]
+            padded_embeddings.append(e)
 
-    Parameters:
-    output (torch.Tensor or numpy.ndarray): Raw model outputs (logits) of shape (n_samples, n_classes).
-    target (torch.Tensor or numpy.ndarray): True labels of shape (n_samples,).
+        # Weighted sum of embeddings from different scales
+        weights = F.softmax(self.alpha, dim=0)
+        combined_embedding = sum(w * e for w, e in zip(weights, padded_embeddings))
 
-    Returns:
-    float: Top-5 accuracy score as a percentage.
-    """
-    # Convert output and target to tensors if they are not already
-    if isinstance(output, torch.Tensor):
-        logits = output.detach()
-    else:
-        logits = torch.tensor(output)
+        return combined_embedding  # Shape: [B, N_max, D]
 
-    if isinstance(target, torch.Tensor):
-        targets = target.detach()
-    else:
-        targets = torch.tensor(target)
+class GatedEmbeddingSelection(nn.Module):
+    def __init__(self, embed_dim=64):
+        super(GatedEmbeddingSelection, self).__init__()
+        self.embed_dim = embed_dim
+        self.hidden_dim = embed_dim // 2
 
-    # Ensure logits are floating-point tensors
-    if not logits.is_floating_point():
-        logits = logits.float()
+        self.fc1 = nn.Linear(embed_dim, self.hidden_dim)
+        self.fc2 = nn.Linear(self.hidden_dim, 1)
 
-    # Ensure targets are of type Long for comparison
-    if targets.dtype != torch.long:
-        targets = targets.long()
+    def forward(self, x):
+        # x: [B, N, D]
+        h = F.relu(self.fc1(x))  # [B, N, D']
+        g = torch.sigmoid(self.fc2(h))  # [B, N, 1]
+        x = x * g  # [B, N, D]
+        return x
 
+class MultiHeadAttentionWithAdaptiveScaling(nn.Module):
+    def __init__(self, embed_dim=64, num_heads=4, gamma=0.5):
+        super(MultiHeadAttentionWithAdaptiveScaling, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.gamma = gamma
 
-    with torch.no_grad():
-        # Handle 1D output (e.g., batch size of 1)
-        if logits.dim() == 1:
-            logits = logits.unsqueeze(0)  # Shape: [1, n_classes]
-            targets = targets.unsqueeze(0)  # Shape: [1]
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.beta = nn.Parameter(torch.zeros(1))
 
-        # Ensure logits have two dimensions: [batch_size, n_classes]
-        if logits.dim() != 2:
-            raise ValueError(f"Expected logits to be 2D, but got {logits.dim()}D")
+    def forward(self, x, key_padding_mask=None):
+        # x: [B, N, D]
+        attn_output, _ = self.attention(x, x, x, key_padding_mask=key_padding_mask)
+        scaling_factor = torch.sigmoid(self.beta) * self.gamma
+        x = attn_output * scaling_factor
+        return x
 
-        # **Removed Softmax:** Not needed for top-k accuracy
-        # logits = torch.nn.functional.softmax(logits, dim=1)
+class PositionalEncoding(nn.Module):
+    def __init__(self, max_len=1000, embed_dim=64):
+        super(PositionalEncoding, self).__init__()
+        self.embed_dim = embed_dim
 
-        # Get the indices of the top 5 predictions for each sample
-        # torch.topk returns a tuple (values, indices); we take indices
-        top5_preds = torch.topk(logits, k=5, dim=1).indices  # Shape: [batch_size, 5]
+        # Create constant 'pe' matrix with values dependent on
+        # position and dimension
+        pe = torch.zeros(max_len, embed_dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * 
+                             (-math.log(10000.0) / embed_dim))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # Shape: [1, max_len, D]
+        self.register_buffer('pe', pe)
 
-        # Expand targets to compare with top5_preds
-        # targets.view(-1, 1) reshapes targets to [batch_size, 1]
-        # This allows broadcasting when comparing with top5_preds
-        targets_expanded = targets.view(-1, 1)  # Shape: [batch_size, 1]
+    def forward(self, x):
+        # x: [B, N, D]
+        x = x + self.pe[:, :x.size(1)]
+        return x
 
-        # Check if the true label is among the top 5 predictions
-        correct = top5_preds.eq(targets_expanded)  # Shape: [batch_size, 5]
+class ClassificationHead(nn.Module):
+    def __init__(self, embed_dim=64, hidden_dim=128, num_classes=10):
+        super(ClassificationHead, self).__init__()
+        self.fc1 = nn.Linear(embed_dim, hidden_dim)
+        self.gelu = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, num_classes)
 
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.gelu(x)
+        x = self.fc2(x)
+        return x
 
-        # For each sample, check if any of the top 5 predictions is correct
-        correct_any = correct.any(dim=1).float()  # Shape: [batch_size]
+class Net(nn.Module):
+    # def __init__(self, img_size=32, patch_sizes=[4, 8], in_channels=3, num_classes=10, 
+    #              embed_dim=64, num_heads=4, hidden_dim=128):
+    def __init__(self, img_size=224, patch_sizes=[8, 16, 32], in_channels=3, num_classes=1000,
+                    embed_dim=768, num_heads=12, hidden_dim=3072):
+    # def __init__(self, img_size=224, patch_sizes=[8, 16, 32], in_channels=3, num_classes=1000,
+    #              embed_dim=1024, num_heads=16, hidden_dim=4096):
+    # def __init__(self, img_size=224, patch_sizes=[8, 16, 32], in_channels=3, num_classes=1000,
+    #                 embed_dim=1280, num_heads=16, hidden_dim=5120):
+        super(Net, self).__init__()
+        self.embed_dim = embed_dim
 
-        # Compute the top-5 accuracy as the mean of correct predictions
-        top5_accuracy = correct_any.mean().item() * 100.0
+        self.patch_embedding = AdaptivePatchEmbedding(img_size, patch_sizes, 
+                                                      in_channels, embed_dim)
+        self.gated_selection = GatedEmbeddingSelection(embed_dim)
+        self.positional_encoding = PositionalEncoding(
+            max_len=(img_size // min(patch_sizes)) ** 2, 
+            embed_dim=embed_dim)
+        self.attention = MultiHeadAttentionWithAdaptiveScaling(embed_dim, num_heads)
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        self.classifier = ClassificationHead(embed_dim, hidden_dim, num_classes)
 
-        return top5_accuracy
+    def forward(self, x):
+        # x: [B, C, H, W]
+        x = self.patch_embedding(x)  # [B, N_max, D]
+        x = self.gated_selection(x)  # [B, N_max, D]
+        x = self.positional_encoding(x)  # [B, N_max, D]
 
-    
-class AverageMeter:
-    """
-    Computes and stores the average and current value.
-    """
-    def __init__(self):
-        self.reset()
+        # Optionally create key_padding_mask if you need to mask padded positions
+        # key_padding_mask = ...  # [B, N_max], with True at positions that are padded
 
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-# Validation function
-def validate(model, val_loader, device):
-    criterion = nn.CrossEntropyLoss()
-    eval_losses = AverageMeter()
-    logger.info("***** Running Validation *****")
-    model.eval()
-    all_preds, all_labels = [], []
-    with torch.no_grad():
-        for inputs, labels in tqdm(val_loader, desc="Validating"):
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            eval_losses.update(loss.item(), inputs.size(0))
-
-            preds = torch.argmax(outputs, dim=-1)
-            all_preds.append(preds.cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
-
-    all_preds = np.concatenate(all_preds, axis=0)
-    all_labels = np.concatenate(all_labels, axis=0)
-    accuracy = simple_accuracy(all_preds, all_labels)
-    top5 = top_5_accuracy(all_preds, all_labels)
-    logger.info(f"Validation Accuracy: {accuracy:.4f}%, Validation Loss: {eval_losses.avg:.4f}, Top-5 Accuracy: {top5:.4f}%")
-    return accuracy, top5
-
-# Training function
-def train_ddp(rank, world_size):
-    # Initialize the process group
-    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
-    torch.cuda.set_device(rank)
-    device = torch.device(f'cuda:{rank}')
-
-    set_seed(42)  # Set a fixed seed for reproducibility
-
-    # Set hyperparameters
-    batch_size = 64
-    num_epochs = 350       
-    learning_rate = 5e-3 / world_size 
-    output_dir = './output'
-
-    # Model setup
-    # model = Net(num_classes=1000).to(device)  # ImageNet has 1000 classes
-    model = load_checkpoint(Net(num_classes=1000).to(device), "./output/checkpoint_epoch_1.pth")
-    model = DDP(model, device_ids=[rank])
-
-    # Data augmentation and normalization for ImageNet
-    transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomCrop(224, padding=4),
-        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    transform_test = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    transform_cifar = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomCrop(32, padding=4),
-        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-    ])
-
-    transform_test_cifar = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-    ])
-
-    train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
-    val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform_test)
-
-    # train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
-    # val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_test_cifar)
-    
-    # Sampler and DataLoader
-    train_sampler = DistributedSampler(train_dataset)
-    val_sampler = DistributedSampler(val_dataset, shuffle=False)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=8, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, num_workers=8, pin_memory=True)
-
-    # Loss, optimizer, and scheduler
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
-
-    # Mixed Precision Scaler
-    scaler = GradScaler()
-
-    # Gradient clipping value
-    clip_value = 1.0  # Clip gradients to this value
-
-    # Regularization weight for geodesic loss
-    lambda_reg = 0.01  # Weight for the geodesic regularization
-
-    # TensorBoard writer (only for rank 0 process)
-    if rank == 0:
-        writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
-    
-    file = open("log.txt", "w")
-    
-    # Training loop
-    for epoch in range(num_epochs):
-        model.train()
-        train_sampler.set_epoch(epoch)
-        running_loss = 0.0
-
-        for i, (inputs, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-
-            total_loss = loss
-            # Backward pass with gradient scaling for mixed precision
-            scaler.scale(total_loss).backward()
-            # Update weights
-            scaler.step(optimizer)
-            scaler.update()
-
-            running_loss += total_loss.item()
-
-        logger.info(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}")
-
-        # Validation
-        accuracy, accuracy5 = validate(model, val_loader, device)
-
-        # TensorBoard writer
-        if rank == 0:
-            writer.add_scalar('Loss/train', running_loss / len(train_loader), epoch+1)
-            writer.add_scalar('Accuracy/val', accuracy, epoch+1)
-            logger.info(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}")
-            file.write(f"Epoch {epoch+1}, Loss: {running_loss / len(train_loader)}, Accuracy: {accuracy:.4f}, Top5: {accuracy5:.4f}\n")
-            file.flush()
-        
-        # Save checkpoint every 5 epochs
-        if (epoch) % 2 == 0:
-            save_model(output_dir, model, epoch+1)
-    
-        scheduler.step()
- 
-    if rank == 0: 
-        writer.close()
-
-    dist.destroy_process_group()
-
-# Main function
-def main():
-    world_size = torch.cuda.device_count()
-    rank = int(os.environ['RANK'])  # rank should be set by distributed launcher
-    train_ddp(rank, world_size)
-
-if __name__ == "__main__":
-    main()
-
+        x = self.attention(x)  # [B, N_max, D]
+        x = x.mean(dim=1)  # Global average pooling over sequence length
+        x = self.layer_norm(x)
+        x = self.classifier(x)  # [B, num_classes]
+        return x
