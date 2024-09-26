@@ -2,194 +2,271 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class PatchEmbedding(nn.Module):
-    def __init__(self, img_size, patch_size, in_channels=3, embed_dim=64):
-        super(PatchEmbedding, self).__init__()
-        self.patch_size = patch_size
-        self.embed_dim = embed_dim
-        self.img_size = img_size
-        self.grid_size = img_size // patch_size
-        self.num_patches = self.grid_size ** 2
-
-        self.proj = nn.Conv2d(
-            in_channels,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size
-        )
-
-    def forward(self, x):
-        # x: [B, C, H, W]
-        x = self.proj(x)  # [B, embed_dim, H/patch_size, W/patch_size]
-        return x  # [B, embed_dim, grid_size, grid_size]
-
-class MultiScalePatchEmbedding(nn.Module):
-    def __init__(self, img_size, patch_sizes, in_channels=3, embed_dim=64):
-        super(MultiScalePatchEmbedding, self).__init__()
+class AdaptivePatchEmbedding(nn.Module):
+    """
+    Learnable dynamic combination of patch embeddings from different patch sizes
+    using linear projections to align embeddings to a consistent sequence length.
+    """
+    def __init__(self, img_size=224, patch_sizes=(8, 16, 32), embed_dim=768):
+        super(AdaptivePatchEmbedding, self).__init__()
         self.patch_sizes = patch_sizes
         self.embed_dim = embed_dim
         self.img_size = img_size
-        self.grid_sizes = [img_size // p for p in patch_sizes]
-        self.H_max = max(self.grid_sizes)
-        self.W_max = max(self.grid_sizes)
-        self.N_max = self.H_max * self.W_max
 
-        self.embeddings = nn.ModuleList([
-            PatchEmbedding(img_size, p, in_channels, embed_dim)
-            for p in patch_sizes
+        # Calculate number of patches for each patch size
+        self.num_patches_dict = {}
+        for patch_size in patch_sizes:
+            assert img_size % patch_size == 0, f"Image size {img_size} must be divisible by patch size {patch_size}"
+            num_patches = (img_size // patch_size) ** 2
+            self.num_patches_dict[str(patch_size)] = num_patches
+
+        # Determine the maximum number of patches
+        self.N_max = max(self.num_patches_dict.values())
+
+        # Create a convolution layer for each possible patch size
+        self.embeddings = nn.ModuleDict({
+            str(patch_size): nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+            for patch_size in patch_sizes
+        })
+
+        # Learnable weights for combining embeddings from different patch sizes
+        self.alpha = nn.Parameter(torch.zeros(len(patch_sizes)))  # For softmax weights
+
+        # Define linear projections for patch sizes with N_k < N_max
+        self.projections = nn.ModuleDict()
+        for patch_size in patch_sizes:
+            N_k = self.num_patches_dict[str(patch_size)]
+            if N_k < self.N_max:
+                # Define a linear layer to map N_k to N_max for each D dimension
+                self.projections[str(patch_size)] = nn.Linear(N_k, self.N_max, bias=True)
+            else:
+                # No projection needed
+                self.projections[str(patch_size)] = nn.Identity()
+
+        # Initialize projection layers
+        for proj in self.projections.values():
+            if isinstance(proj, nn.Linear):
+                nn.init.xavier_uniform_(proj.weight)
+                if proj.bias is not None:
+                    nn.init.zeros_(proj.bias)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        embeddings = []
+
+        # Compute embeddings for all patch sizes
+        for patch_size in self.patch_sizes:
+            proj_key = str(patch_size)
+            embed_layer = self.embeddings[proj_key].to(x.device)
+            emb = embed_layer(x)  # Shape: [B, D, H_p, W_p]
+            H_p, W_p = emb.shape[2], emb.shape[3]
+            N_k = H_p * W_p
+            assert N_k == self.num_patches_dict[proj_key], f"Expected {self.num_patches_dict[proj_key]} patches, but got {N_k}"
+            emb = emb.flatten(2).transpose(1, 2)  # Shape: [B, N_k, D]
+
+            # Apply linear projection if necessary
+            proj_layer = self.projections[proj_key]
+            if isinstance(proj_layer, nn.Linear):
+                # Reshape to [B * D, N_k]
+                emb_reshaped = emb.permute(0, 2, 1).contiguous()  # [B, D, N_k]
+                emb_reshaped = emb_reshaped.view(batch_size * self.embed_dim, N_k)  # [B*D, N_k]
+                emb_proj = proj_layer(emb_reshaped)  # [B*D, N_max]
+                emb_proj = emb_proj.view(batch_size, self.embed_dim, self.N_max)  # [B, D, N_max]
+                emb_proj = emb_proj.transpose(1, 2).contiguous()  # [B, N_max, D]
+                embeddings.append(emb_proj)
+            else:
+                # Identity projection
+                embeddings.append(emb)  # [B, N_max, D]
+
+        # Compute weights via softmax
+        weights = F.softmax(self.alpha, dim=0)  # Shape: [K]
+
+        # Stack embeddings: [K, B, N_max, D]
+        stacked_embeddings = torch.stack(embeddings, dim=0)  # [K, B, N_max, D]
+
+        # Apply weights: [B, N_max, D]
+        weights = weights.view(-1, 1, 1, 1)  # [K, 1, 1, 1]
+        combined_embedding = (weights * stacked_embeddings).sum(dim=0)  # [B, N_max, D]
+
+        # Apply LayerNorm for better training stability
+        combined_embedding = F.layer_norm(combined_embedding, combined_embedding.shape[-1:])
+
+        return combined_embedding  # Shape: [B, N_max, embed_dim]
+
+class GatedPatchSelection(nn.Module):
+    """
+    A gating mechanism that learns to select important patches.
+    """
+    def __init__(self, embed_dim):
+        super(GatedPatchSelection, self).__init__()
+        D_prime = embed_dim // 2
+        self.gating_network = nn.Sequential(
+            nn.Linear(embed_dim, D_prime),
+            nn.ReLU(),
+            nn.Linear(D_prime, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # Compute gate values for each patch
+        gate_scores = self.gating_network(x).squeeze(-1)  # Shape: [B, N_max]
+        gated_output = x * gate_scores.unsqueeze(-1)  # Shape: [B, N_max, embed_dim]
+        return gated_output
+
+class MultiScaleAttention(nn.Module):
+    """
+    Multi-scale attention heads to capture details at different resolutions,
+    with adaptive scaling of attention scores.
+    """
+    def __init__(self, embed_dim, num_heads, num_scales=3, scaling_factor=0.5):
+        super(MultiScaleAttention, self).__init__()
+        self.num_scales = num_scales
+        self.scaling_factor = scaling_factor
+
+        self.attention_heads = nn.ModuleList([
+            nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+            for _ in range(num_scales)
         ])
 
-    def forward(self, x):
-        # x: [B, C, H, W]
-        B = x.size(0)
-        embeddings_aligned = []
-        for i, embedding_layer in enumerate(self.embeddings):
-            embeddings = embedding_layer(x)  # [B, D, H_k, W_k]
-            H_k, W_k = embeddings.size(2), embeddings.size(3)
-            if H_k == self.H_max and W_k == self.W_max:
-                embeddings_aligned.append(embeddings)  # [B, D, H_max, W_max]
-            else:
-                # Expand embeddings to [B, D, H_max, W_max] by replicating
-                factor_H = self.H_max // H_k
-                factor_W = self.W_max // W_k
+        # Learnable scaling factors for each scale
+        self.beta = nn.Parameter(torch.ones(num_scales))
 
-                embeddings_expanded = embeddings.repeat_interleave(factor_H, dim=2)
-                embeddings_expanded = embeddings_expanded.repeat_interleave(factor_W, dim=3)
-                embeddings_aligned.append(embeddings_expanded)  # [B, D, H_max, W_max]
+        self.gamma = scaling_factor  # Predefined constant scaling factor
 
-        # Concatenate along the channel dimension
-        embeddings_concat = torch.cat(embeddings_aligned, dim=1)  # [B, K*D, H_max, W_max]
-        # Flatten and transpose to [B, N_max, K*D]
-        embeddings_concat = embeddings_concat.flatten(2).transpose(1, 2)  # [B, N_max, K*D]
-        return embeddings_concat  # [B, N_max, K*D]
+        # Projection after concatenation
+        self.projection = nn.Linear(embed_dim * num_scales, embed_dim)
 
-class MultiScaleEmbeddingProjection(nn.Module):
-    def __init__(self, in_dim, out_dim):
-        super(MultiScaleEmbeddingProjection, self).__init__()
-        self.proj = nn.Linear(in_dim, out_dim)
+        # Initialize projection layer
+        nn.init.xavier_uniform_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
 
     def forward(self, x):
-        # x: [B, N_max, K*D]
-        x = self.proj(x)  # [B, N_max, D]
-        return x
+        multi_scale_outputs = []
+        for s in range(self.num_scales):
+            attn_head = self.attention_heads[s]
+            attn_output, attn_weights = attn_head(x, x, x)  # attn_output: [B, N_max, D]
+            # Apply adaptive scaling
+            adaptive_scale = torch.sigmoid(self.beta[s]) * self.gamma  # Scalar
+            attn_output_scaled = attn_output * adaptive_scale  # [B, N_max, D]
+            multi_scale_outputs.append(attn_output_scaled)
 
-class GatedEmbeddingSelection(nn.Module):
-    def __init__(self, embed_dim):
-        super(GatedEmbeddingSelection, self).__init__()
-        D = embed_dim
-        D_prime = D // 2
-        self.fc1 = nn.Linear(D, D_prime)
-        self.fc2 = nn.Linear(D_prime, 1)
-        self.activation = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
+        # Concatenate outputs from all scales
+        concatenated = torch.cat(multi_scale_outputs, dim=-1)  # [B, N_max, D * num_scales]
 
-    def forward(self, x):
-        # x: [B, N_max, D]
-        h = self.activation(self.fc1(x))  # [B, N_max, D']
-        g = self.sigmoid(self.fc2(h))  # [B, N_max, 1]
-        x = g * x  # [B, N_max, D]
-        return x
+        # Project back to original embed_dim
+        projected_output = self.projection(concatenated)  # [B, N_max, D]
 
-class PositionalEncoding2D(nn.Module):
-    def __init__(self, embed_dim, height, width):
-        super(PositionalEncoding2D, self).__init__()
-        self.embed_dim = embed_dim
-        self.height = height
-        self.width = width
+        # Apply LayerNorm for better training stability
+        projected_output = F.layer_norm(projected_output, projected_output.shape[-1:])
 
-        pe = self.create_positional_encoding(embed_dim, height, width)
-        self.register_buffer('pe', pe)
+        return projected_output
 
-    def create_positional_encoding(self, embed_dim, height, width):
-        pe = torch.zeros(height * width, embed_dim)
-        y_pos, x_pos = torch.meshgrid(
-            torch.arange(height, dtype=torch.float32),
-            torch.arange(width, dtype=torch.float32),
-            indexing='ij'
+class TransformerBlock(nn.Module):
+    """
+    Transformer block with adaptive components.
+    """
+    def __init__(self, embed_dim, num_heads, mlp_dim):
+        super(TransformerBlock, self).__init__()
+        self.attn = MultiScaleAttention(embed_dim, num_heads)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_dim),
+            nn.GELU(),
+            nn.Linear(mlp_dim, embed_dim)
         )
-        y_pos = y_pos.flatten().unsqueeze(1)  # [H*W, 1]
-        x_pos = x_pos.flatten().unsqueeze(1)  # [H*W, 1]
+        self.norm2 = nn.LayerNorm(embed_dim)
 
-        div_term = torch.exp(torch.arange(0, embed_dim, 2, dtype=torch.float32) * (-torch.log(torch.tensor(10000.0)) / embed_dim))
-        pe[:, 0::2] = torch.sin((x_pos + y_pos) * div_term)
-        pe[:, 1::2] = torch.cos((x_pos + y_pos) * div_term)
-        return pe  # [H*W, D]
-
-    def forward(self, x):
-        # x: [B, N_max, D]
-        x = x + self.pe.unsqueeze(0).to(x.device)  # [B, N_max, D]
-        return x
-
-class SelfAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads):
-        super(SelfAttention, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads)
+        # Initialize MLP layers
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        # x: [B, N_max, D]
-        x = x.transpose(0, 1)  # [N_max, B, D]
-        attn_output, _ = self.attention(x, x, x)
-        x = attn_output.transpose(0, 1)  # [B, N_max, D]
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 class Net(nn.Module):
+    """
+    The main model with dynamic positional encoding generation, optimized for classification.
+    """
     # def __init__(
     #     self,
-    #     img_size=32,
-    #     patch_sizes=[4, 8],
+    #     img_size=224,
+    #     patch_sizes=(8, 16, 32),
     #     in_channels=3,
-    #     num_classes=10,
-    #     embed_dim=64,
-    #     num_heads=4
+    #     num_classes=1000,
+    #     embed_dim=768,
+    #     num_heads=12,
+    #     mlp_dim=3072,
+    #     num_layers=12
     # ):
     
     def __init__(
         self,
-        img_size=224,
-        patch_sizes=[8, 16, 32],
+        img_size=32,
+        patch_sizes=(4, 8),
         in_channels=3,
-        num_classes=1000,
-        embed_dim=768,
-        num_heads=12
+        num_classes=10,
+        embed_dim=64,
+        num_heads=4,
+        mlp_dim=128,
+        num_layers=4
     ):
-        
         super(Net, self).__init__()
+        self.patch_embedding = AdaptivePatchEmbedding(img_size, patch_sizes, embed_dim)
         self.embed_dim = embed_dim
-        self.num_classes = num_classes
-        self.hidden_dim = embed_dim * 2
+        self.N_max = self.patch_embedding.N_max  # Ensure consistency
 
-        self.patch_embedding = MultiScalePatchEmbedding(
-            img_size=img_size,
-            patch_sizes=patch_sizes,
-            in_channels=in_channels,
-            embed_dim=embed_dim
+        self.gated_selection = GatedPatchSelection(embed_dim)
+        self.transformer_blocks = nn.ModuleList(
+            [TransformerBlock(embed_dim, num_heads, mlp_dim) for _ in range(num_layers)]
         )
-        self.projection = MultiScaleEmbeddingProjection(
-            in_dim=len(patch_sizes) * embed_dim,
-            out_dim=embed_dim
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, num_classes)
         )
-        self.gated_embedding = GatedEmbeddingSelection(embed_dim)
-        self.positional_encoding = PositionalEncoding2D(
-            embed_dim=embed_dim,
-            height=img_size // min(patch_sizes),
-            width=img_size // min(patch_sizes)
-        )
-        self.self_attention = SelfAttention(embed_dim, num_heads)
-        self.layer_norm = nn.LayerNorm(embed_dim)
-        self.classifier = nn.Sequential(
-            nn.Linear(embed_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, num_classes)
-        )
+
+        # Initialize classification head
+        for m in self.mlp_head:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        # x: [B, C, H, W]
-        x = self.patch_embedding(x)            # [B, N_max, K*D]
-        x = self.projection(x)                 # [B, N_max, D]
-        x = self.gated_embedding(x)            # [B, N_max, D]
-        x = self.positional_encoding(x)        # [B, N_max, D]
-        x = self.self_attention(x)             # [B, N_max, D]
-        x = self.layer_norm(x)                 # [B, N_max, D]
-        x = x.mean(dim=1)                      # Global average pooling [B, D]
-        x = self.classifier(x)                 # [B, num_classes]
-        return x
+        # Adaptive Patch Embedding with Linear Projection
+        E = self.patch_embedding(x)  # Shape: [B, N_max, D]
+        batch_size, N_max, D = E.size()
+
+        # Dynamic Positional Encoding
+        pos_encoding = self.generate_positional_encoding(N_max, D, device=x.device)  # [1, N_max, D]
+        X = E + pos_encoding  # [B, N_max, D]
+
+        # Gated Patch Selection
+        X = self.gated_selection(X)  # [B, N_max, D]
+
+        # Transformer Blocks
+        for block in self.transformer_blocks:
+            X = block(X)  # [B, N_max, D]
+
+        # Global Pooling and Classification Head
+        z = X.mean(dim=1)  # [B, D]
+        logits = self.mlp_head(z)  # [B, num_classes]
+
+        return logits
+
+    def generate_positional_encoding(self, num_patches, embed_dim, device):
+        """
+        Generate a sinusoidal positional encoding dynamically based on the number of patches.
+        """
+        position = torch.arange(0, num_patches, dtype=torch.float, device=device).unsqueeze(1)  # [N_max, 1]
+        div_term = torch.exp(torch.arange(0, embed_dim, 2, device=device).float() * (-torch.log(torch.tensor(10000.0)) / embed_dim))
+
+        pos_enc = torch.zeros((num_patches, embed_dim), device=device)
+        pos_enc[:, 0::2] = torch.sin(position * div_term)  # Even indices
+        pos_enc[:, 1::2] = torch.cos(position * div_term)  # Odd indices
+
+        return pos_enc.unsqueeze(0)  # [1, N_max, D]
