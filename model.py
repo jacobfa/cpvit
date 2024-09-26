@@ -192,29 +192,53 @@ class Net(nn.Module):
     """
     The main model with dynamic positional encoding generation, optimized for classification.
     """
+    def __init__(
+        self,
+        img_size=224,
+        patch_sizes=(8, 16, 32),
+        in_channels=3,
+        num_classes=1000,
+        embed_dim=768,
+        num_heads=12,
+        mlp_dim=3072,
+        num_layers=12
+    ):
+    
     # def __init__(
     #     self,
     #     img_size=224,
     #     patch_sizes=(8, 16, 32),
     #     in_channels=3,
     #     num_classes=1000,
-    #     embed_dim=768,
-    #     num_heads=12,
-    #     mlp_dim=3072,
+    #     embed_dim=1024,
+    #     num_heads=16,
+    #     mlp_dim=4096,
     #     num_layers=12
     # ):
     
-    def __init__(
-        self,
-        img_size=32,
-        patch_sizes=(4, 8),
-        in_channels=3,
-        num_classes=10,
-        embed_dim=64,
-        num_heads=4,
-        mlp_dim=128,
-        num_layers=4
-    ):
+
+    # def __init__(
+    #     self,
+    #     img_size=224,
+    #     patch_sizes=(8, 16, 32),
+    #     in_channels=3,
+    #     num_classes=1000,
+    #     embed_dim=1280,
+    #     num_heads=16,
+    #     mlp_dim=5120,
+    #     num_layers=16
+    # ):
+    # def __init__(
+    #     self,
+    #     img_size=32,
+    #     patch_sizes=(4, 8),
+    #     in_channels=3,
+    #     num_classes=10,
+    #     embed_dim=64,
+    #     num_heads=4,
+    #     mlp_dim=128,
+    #     num_layers=4
+    # ):
         super(Net, self).__init__()
         self.patch_embedding = AdaptivePatchEmbedding(img_size, patch_sizes, embed_dim)
         self.embed_dim = embed_dim
