@@ -7,7 +7,7 @@ class AdaptivePatchEmbedding(nn.Module):
     Learnable dynamic combination of patch embeddings from different patch sizes
     using linear projections to align embeddings to a consistent sequence length.
     """
-    def __init__(self, img_size=224, patch_sizes=(8, 16, 32), embed_dim=768):
+    def __init__(self, img_size=32, patch_sizes=(2, 4, 8), embed_dim=256):
         super(AdaptivePatchEmbedding, self).__init__()
         self.patch_sizes = patch_sizes
         self.embed_dim = embed_dim
@@ -38,6 +38,7 @@ class AdaptivePatchEmbedding(nn.Module):
             N_k = self.num_patches_dict[str(patch_size)]
             if N_k < self.N_max:
                 # Define a linear layer to map N_k to N_max for each D dimension
+                # Including bias for better learning
                 self.projections[str(patch_size)] = nn.Linear(N_k, self.N_max, bias=True)
             else:
                 # No projection needed
@@ -192,53 +193,10 @@ class Net(nn.Module):
     """
     The main model with dynamic positional encoding generation, optimized for classification.
     """
-    def __init__(
-        self,
-        img_size=224,
-        patch_sizes=(8, 16, 32),
-        in_channels=3,
-        num_classes=1000,
-        embed_dim=768,
-        num_heads=12,
-        mlp_dim=3072,
-        num_layers=12
-    ):
-    
-    # def __init__(
-    #     self,
-    #     img_size=224,
-    #     patch_sizes=(8, 16, 32),
-    #     in_channels=3,
-    #     num_classes=1000,
-    #     embed_dim=1024,
-    #     num_heads=16,
-    #     mlp_dim=4096,
-    #     num_layers=12
-    # ):
-    
-
-    # def __init__(
-    #     self,
-    #     img_size=224,
-    #     patch_sizes=(8, 16, 32),
-    #     in_channels=3,
-    #     num_classes=1000,
-    #     embed_dim=1280,
-    #     num_heads=16,
-    #     mlp_dim=5120,
-    #     num_layers=16
-    # ):
-    # def __init__(
-    #     self,
-    #     img_size=32,
-    #     patch_sizes=(4, 8),
-    #     in_channels=3,
-    #     num_classes=10,
-    #     embed_dim=64,
-    #     num_heads=4,
-    #     mlp_dim=128,
-    #     num_layers=4
-    # ):
+    # def __init__(self, img_size=32, patch_sizes=(2, 4, 8), embed_dim=256, num_heads=8, mlp_dim=512, num_layers=6, num_classes=10):
+    def __init__(self, img_size=224, patch_sizes=(4, 8, 16), embed_dim=768, num_heads=12, mlp_dim=3072, num_layers=12, num_classes=1000):
+    # def __init__(self, img_size=224, patch_sizes=(4, 8, 16), embed_dim=1024, num_heads=16, mlp_dim=4096, num_layers=12, num_classes=1000):
+    # def __init__(self, img_size=224, patch_sizes=(4, 8, 16), embed_dim=1280, num_heads=16, mlp_dim=5120, num_layers=12, num_classes=1000):
         super(Net, self).__init__()
         self.patch_embedding = AdaptivePatchEmbedding(img_size, patch_sizes, embed_dim)
         self.embed_dim = embed_dim
@@ -278,7 +236,7 @@ class Net(nn.Module):
 
         # Global Pooling and Classification Head
         z = X.mean(dim=1)  # [B, D]
-        logits = self.mlp_head(z)  # [B, num_classes]
+        logits = self.mlp_head(z)  # [B, C]
 
         return logits
 
@@ -288,9 +246,9 @@ class Net(nn.Module):
         """
         position = torch.arange(0, num_patches, dtype=torch.float, device=device).unsqueeze(1)  # [N_max, 1]
         div_term = torch.exp(torch.arange(0, embed_dim, 2, device=device).float() * (-torch.log(torch.tensor(10000.0)) / embed_dim))
-
+        
         pos_enc = torch.zeros((num_patches, embed_dim), device=device)
         pos_enc[:, 0::2] = torch.sin(position * div_term)  # Even indices
         pos_enc[:, 1::2] = torch.cos(position * div_term)  # Odd indices
-
+        
         return pos_enc.unsqueeze(0)  # [1, N_max, D]
