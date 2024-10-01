@@ -122,8 +122,14 @@ class ClassificationHead(nn.Module):
 class Net(nn.Module):
     # def __init__(self, img_size=32, patch_sizes=[2, 4, 8], strides=[1, 2, 4], in_channels=3,
     #              embed_dim=128, num_heads=8, num_layers=12, mlp_dim=128*4, num_classes=10, dropout=0.1):
-    def __init__(self, img_size=32, patch_sizes=[4, 8 , 16], strides=[2, 4, 8], in_channels=3,
+    def __init__(self, img_size=224, patch_sizes=[4, 8 , 16], strides=[2, 4, 8], in_channels=3,
                  embed_dim=768, num_heads=12, num_layers=12, mlp_dim=768*4, num_classes=1000, dropout=0.1):
+        
+    # def __init__(self, img_size=224, patch_sizes=[4, 8 , 16], strides=[2, 4, 8], in_channels=3,
+    #              embed_dim=1024, num_heads=12, num_layers=16, mlp_dim=1024*4, num_classes=1000, dropout=0.1):
+    
+    # def __init__(self, img_size=224, patch_sizes=[4, 8 , 16], strides=[2, 4, 8], in_channels=3,
+    #              embed_dim=1280, num_heads=16, num_layers=16, mlp_dim=1280*4, num_classes=1000, dropout=0.1):
     
         super(Net, self).__init__()
         self.embed_dim = embed_dim
