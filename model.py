@@ -1,176 +1,150 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
-# Base Module
-class BaseModule(nn.Module):
-    def __init__(self):
-        super(BaseModule, self).__init__()
-
-# Patch Embedding Module
-class PatchEmbedding(BaseModule):
-    def __init__(self, in_channels, embed_dim, patch_size, stride):
+class PatchEmbedding(nn.Module):
+    def __init__(self, img_size=32, patch_sizes=[2, 4, 8], strides=[1, 2, 4], in_channels=3, embed_dim=512):
         super(PatchEmbedding, self).__init__()
-        self.conv = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=embed_dim,
-            kernel_size=patch_size,
-            stride=stride,
-            padding=patch_size // 2,
-        )
-
-    def forward(self, x):
-        x = self.conv(x)  # [B, embed_dim, H_p, W_p]
-        H_p, W_p = x.shape[2], x.shape[3]
-        x = x.flatten(2).transpose(1, 2)  # [B, N_k, embed_dim]
-        return x, H_p, W_p
-
-# Gated Embedding Selection Module
-class GatedEmbeddingSelection(BaseModule):
-    def __init__(self, embed_dim):
-        super(GatedEmbeddingSelection, self).__init__()
-        self.fc1 = nn.Linear(embed_dim, embed_dim // 2)
-        self.fc2 = nn.Linear(embed_dim // 2, 1)
-
-    def forward(self, embeddings):
-        h = F.relu(self.fc1(embeddings))
-        g = torch.sigmoid(self.fc2(h))
-        embeddings_gated = embeddings * g  # Element-wise multiplication
-        return embeddings_gated
-
-# Positional Encoding Module
-class PositionalEncoding(BaseModule):
-    def __init__(self, embed_dim):
-        super(PositionalEncoding, self).__init__()
-        self.embed_dim = embed_dim
-        self.position_embedding = None
-
-    def forward(self, positions):
-        if self.position_embedding is None:
-            pe = self._get_positional_encoding(positions)
-            self.position_embedding = pe
-        else:
-            pe = self.position_embedding
-        return pe
-
-    def _get_positional_encoding(self, positions):
-        device = positions.device
-        N_max = positions.size(0)
-        pe = torch.zeros(N_max, self.embed_dim, device=device)
-        div_term = torch.exp(
-            torch.arange(0, self.embed_dim, 2, device=device) *
-            (-torch.log(torch.tensor(10000.0, device=device)) / self.embed_dim)
-        )
-        pos_x = positions[:, 0].unsqueeze(1)
-        pos_y = positions[:, 1].unsqueeze(1)
-        pe[:, 0::2] = torch.sin(pos_x * div_term)
-        pe[:, 1::2] = torch.cos(pos_y * div_term)
-        return pe
-
-# Multi-Scale Transformer Module
-class MultiScaleTransformer(BaseModule):
-    def __init__(self, embed_dim, num_heads, dropout):
-        super(MultiScaleTransformer, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
-        self.layer_norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, embeddings):
-        embeddings_transposed = embeddings.transpose(0, 1)
-        attn_output, _ = self.attention(embeddings_transposed, embeddings_transposed, embeddings_transposed)
-        attn_output = attn_output.transpose(0, 1)
-        attn_output = self.layer_norm(attn_output)
-        return attn_output
-
-# Final Classification Module
-class ClassificationHead(BaseModule):
-    def __init__(self, embed_dim, num_classes):
-        super(ClassificationHead, self).__init__()
-        self.classifier = nn.Linear(embed_dim, num_classes)
-
-    def forward(self, x):
-        logits = self.classifier(x)
-        return logits
-
-# Main Network
-class Net(BaseModule):
-    def __init__(
-        self,
-        num_classes=1000,
-        image_size=224,
-        patch_sizes=[4, 8, 16],
-        strides=[4, 8, 16],
-        embed_dim=768,
-        num_heads=12,
-        dropout=0.1,
-    ):
-        super(Net, self).__init__()
-        self.num_classes = num_classes
-        self.image_size = image_size
         self.embed_dim = embed_dim
         self.patch_sizes = patch_sizes
         self.strides = strides
+        self.convs = nn.ModuleList()
+        for p, s in zip(patch_sizes, strides):
+            self.convs.append(
+                nn.Conv2d(in_channels, embed_dim, kernel_size=p, stride=s, padding=p // 2)
+            )
+        self.num_patches_list = []
+        for p, s in zip(patch_sizes, strides):
+            num_patches = ((img_size + s - 1) // s) ** 2
+            self.num_patches_list.append(num_patches)
+        self.N_max = max(self.num_patches_list)
 
-        # Modules
-        self.patch_embeddings = nn.ModuleList([
-            PatchEmbedding(3, embed_dim, p, s) for p, s in zip(patch_sizes, strides)
+    def forward(self, x):
+        embeddings_list = []
+        for conv in self.convs:
+            emb = conv(x)  # [B, D, H_p, W_p]
+            B, D, H_p, W_p = emb.shape
+            emb = emb.flatten(2).transpose(1, 2)  # [B, N_k, D]
+            embeddings_list.append(emb)
+        return embeddings_list  # List of embeddings at different scales
+
+
+class GatedEmbeddingSelection(nn.Module):
+    def __init__(self, embed_dim):
+        super(GatedEmbeddingSelection, self).__init__()
+        D = embed_dim
+        D_prime = D * 2
+        self.Wg1 = nn.Linear(D, D_prime)
+        self.Wg2 = nn.Linear(D_prime, D_prime)
+        self.Wg3 = nn.Linear(D_prime, 1)
+        self.proj = nn.Linear(D, D)
+        self.activation = nn.GELU()
+
+    def forward(self, embeddings_list):
+        N_max = max([emb.size(1) for emb in embeddings_list])
+        embeddings_padded = []
+        for emb in embeddings_list:
+            B, N_k, D = emb.size()
+            if N_k < N_max:
+                pad_size = N_max - N_k
+                padding = torch.zeros(B, pad_size, D, device=emb.device, dtype=emb.dtype)
+                emb_padded = torch.cat([emb, padding], dim=1)  # [B, N_max, D]
+            else:
+                emb_padded = emb
+            embeddings_padded.append(emb_padded)
+        embeddings_stack = torch.stack(embeddings_padded, dim=2)  # [B, N_max, num_scales, D]
+        B, N_max, num_scales, D = embeddings_stack.size()
+        embeddings = embeddings_stack.view(B * N_max * num_scales, D)
+        h = self.activation(self.Wg1(embeddings))  # [B * N_max * num_scales, D']
+        h = self.activation(self.Wg2(h))  # Additional layer
+        g = torch.sigmoid(self.Wg3(h))  # [B * N_max * num_scales, 1]
+        embeddings_gated = embeddings * g  # [B * N_max * num_scales, D]
+        embeddings_gated = embeddings_gated.view(B, N_max, num_scales, D)
+        aggregated_embeddings = embeddings_gated.sum(dim=2)  # [B, N_max, D]
+        aggregated_embeddings = self.proj(aggregated_embeddings)  # [B, N_max, D]
+        return aggregated_embeddings
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, embed_dim):
+        super(PositionalEncoding, self).__init__()
+        self.embed_dim = embed_dim
+
+    def forward(self, x):
+        seq_len = x.size(1)
+        device = x.device
+        position = torch.arange(0, seq_len, dtype=torch.float32, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.embed_dim, 2, device=device).float() * (-math.log(10000.0) / self.embed_dim))
+        pe = torch.zeros(seq_len, self.embed_dim, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)  # even indices
+        pe[:, 1::2] = torch.cos(position * div_term)  # odd indices
+        pe = pe.unsqueeze(0)  # [1, seq_len, embed_dim]
+        x = x + pe
+        return x
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, embed_dim, num_heads, mlp_dim, dropout=0.1):
+        super(TransformerEncoderLayer, self).__init__()
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        self.layernorm1 = nn.LayerNorm(embed_dim)
+        self.layernorm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, src):
+        src2 = self.attention(src, src, src)[0]
+        src = src + src2
+        src = self.layernorm1(src)
+        src2 = self.mlp(src)
+        src = src + src2
+        src = self.layernorm2(src)
+        return src
+
+
+class ClassificationHead(nn.Module):
+    def __init__(self, embed_dim, num_classes):
+        super(ClassificationHead, self).__init__()
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        self.fc = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, x):
+        x = self.layer_norm(x)
+        x = self.fc(x)
+        return x
+
+
+class Net(nn.Module):
+    # def __init__(self, img_size=32, patch_sizes=[2, 4, 8], strides=[1, 2, 4], in_channels=3,
+    #              embed_dim=128, num_heads=8, num_layers=12, mlp_dim=128*4, num_classes=10, dropout=0.1):
+    def __init__(self, img_size=32, patch_sizes=[4, 8 , 16], strides=[2, 4, 8], in_channels=3,
+                 embed_dim=768, num_heads=12, num_layers=12, mlp_dim=768*4, num_classes=1000, dropout=0.1):
+    
+        super(Net, self).__init__()
+        self.embed_dim = embed_dim
+        self.patch_embedding = PatchEmbedding(img_size, patch_sizes, strides, in_channels, embed_dim)
+        self.gated_embedding = GatedEmbeddingSelection(embed_dim)
+        self.positional_encoding = PositionalEncoding(embed_dim)
+        self.transformer_layers = nn.ModuleList([
+            TransformerEncoderLayer(embed_dim, num_heads, mlp_dim, dropout)
+            for _ in range(num_layers)
         ])
-        self.gate = GatedEmbeddingSelection(embed_dim)
-        self.projection = nn.Linear(embed_dim, embed_dim)
-        self.position_encoding = PositionalEncoding(embed_dim)
-        self.transformer = MultiScaleTransformer(embed_dim, num_heads, dropout)
         self.classification_head = ClassificationHead(embed_dim, num_classes)
 
     def forward(self, x):
         B = x.size(0)
-        device = x.device
-
-        embeddings_list = []
-        positions_list = []
-        for pe in self.patch_embeddings:
-            e, H_p, W_p = pe(x)
-            embeddings_list.append(e)
-
-            pos_y = torch.arange(H_p, device=device).float() * (self.image_size / H_p)
-            pos_x = torch.arange(W_p, device=device).float() * (self.image_size / W_p)
-            grid_y, grid_x = torch.meshgrid(pos_y, pos_x, indexing='ij')
-            positions = torch.stack((grid_x, grid_y), dim=-1).reshape(-1, 2)
-            positions_list.append(positions)
-
-        N_max = max(e.size(1) for e in embeddings_list)
-        embeddings_aligned = []
-        positions_aligned = []
-
-        for e, positions in zip(embeddings_list, positions_list):
-            N_k = e.size(1)
-            if N_k < N_max:
-                repeat_factor = N_max // N_k + 1
-                e = e.repeat(1, repeat_factor, 1)[:, :N_max, :]
-                positions = positions.repeat(repeat_factor, 1)[:N_max, :]
-            embeddings_aligned.append(e)
-            positions_aligned.append(positions)
-
-        embeddings_stack = torch.stack(embeddings_aligned, dim=2)
-        positions_stack = torch.stack(positions_aligned, dim=0)
-
-        embeddings_flat = embeddings_stack.reshape(-1, self.embed_dim)
-
-        embeddings_gated = self.gate(embeddings_flat)
-
-        embeddings_gated = embeddings_gated.view(B, N_max, len(self.patch_sizes), self.embed_dim)
-
-        embeddings_aggregated = embeddings_gated.sum(dim=2)
-
-        embeddings_projected = self.projection(embeddings_aggregated)
-
-        positions_mean = torch.mean(positions_stack, dim=0)
-        pe = self.position_encoding(positions_mean)
-
-        embeddings_positioned = embeddings_projected + pe.unsqueeze(0)
-
-        attn_output = self.transformer(embeddings_positioned)
-
-        z = attn_output.mean(dim=1)
-
+        embeddings_list = self.patch_embedding(x)
+        embeddings = self.gated_embedding(embeddings_list)  # [B, N_max, D]
+        embeddings = self.positional_encoding(embeddings)
+        embeddings = embeddings.transpose(0, 1)  # [N_max, B, D]
+        for layer in self.transformer_layers:
+            embeddings = layer(embeddings)
+        embeddings = embeddings.transpose(0, 1)  # [B, N_max, D]
+        z = embeddings.mean(dim=1)  # [B, D]
         logits = self.classification_head(z)
-
         return logits
