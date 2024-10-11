@@ -173,7 +173,7 @@ def train_ddp(rank, world_size):
     set_seed(42)  # Set a fixed seed for reproducibility
 
     # Set hyperparameters
-    batch_size = 64
+    batch_size = 4
     num_epochs = 350       
     learning_rate = 5e-3 / world_size 
     output_dir = './output'
@@ -217,8 +217,8 @@ def train_ddp(rank, world_size):
     train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
     val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform_test)
 
-    # train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
-    # val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_test_cifar)
+    # train_dataset = datasets.CIFAR100(root='/data/jacob/cifar100/', train=True, download=True, transform=transform_cifar)
+    # val_dataset = datasets.CIFAR100(root='/data/jacob/cifar100/', train=False, download=True, transform=transform_test_cifar)
     
     # Sampler and DataLoader
     train_sampler = DistributedSampler(train_dataset)
