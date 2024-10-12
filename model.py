@@ -41,7 +41,7 @@ class AdaptivePatchEmbedding(nn.Module):
             emb = emb.permute(0, 2, 1)  # (B, N_k, D)
             embeddings.append(emb)
 
-            # Compute positions for each patch
+            # Compute positions for each patch (optional, can be ignored)
             h_positions = torch.arange(Hk, device=device) * self.strides[i]
             w_positions = torch.arange(Wk, device=device) * self.strides[i]
             grid_y, grid_x = torch.meshgrid(h_positions, w_positions, indexing='ij')
@@ -83,40 +83,33 @@ class AggregationProjection(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, max_len=10000, embed_dim=128):
+    def __init__(self, embed_dim):
         super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, embed_dim)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # (max_len, 1)
-        div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
-        pe[:, 0::2] = torch.sin(position * div_term)  # even indices
-        pe[:, 1::2] = torch.cos(position * div_term)  # odd indices
-        pe = pe.unsqueeze(0)  # (1, max_len, D)
-        self.register_buffer('pe', pe)
+        self.embed_dim = embed_dim
 
     def forward(self, x):
         # x: (B, N, D)
-        x = x + self.pe[:, :x.size(1), :].to(x.device)
+        B, N, D = x.size()
+        device = x.device
+
+        # positions shape: [N, 1]
+        position = torch.arange(0, N, dtype=torch.float, device=device).unsqueeze(1)
+
+        # div_term shape: [1, D/2]
+        div_term = torch.exp(torch.arange(0, D, 2, dtype=torch.float, device=device) * (-math.log(10000.0) / D))
+
+        pe = torch.zeros(N, D, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        pe = pe.unsqueeze(0)  # shape [1, N, D]
+        x = x + pe  # (B, N, D)
         return x
 
 
 class Net(nn.Module):
-    # def __init__(self, num_classes=10, in_channels=3, embed_dim=128,
-    #              patch_sizes=[4, 8, 16], strides=None, max_len=10000,
-    #              n_heads=8, n_layers=6):
-    
     def __init__(self, num_classes=1000, in_channels=3, embed_dim=768,
-                    patch_sizes=[4, 8, 16], strides=None, max_len=10000,
-                    n_heads=12, n_layers=12):
-        
-    # def __init__(self, num_classes=1000, in_channels=3, embed_dim=1024,
-    #                 patch_sizes=[4, 8, 16], strides=None, max_len=10000,
-    #                 n_heads=16, n_layers=12):
-        
-    # def __init__(self, num_classes=1000, in_channels=3, embed_dim=1280,
-    #                 patch_sizes=[4, 8, 16], strides=None, max_len=10000,
-    #                 n_heads=20, n_layers=16):
-                 
-
+                 patch_sizes=[4, 8, 16], strides=None, n_heads=12, n_layers=12):
         super(Net, self).__init__()
         self.embed_dim = embed_dim
         self.num_classes = num_classes
@@ -132,10 +125,10 @@ class Net(nn.Module):
         self.aggregation_projection = AggregationProjection(embed_dim)
 
         # Positional Encoding
-        self.positional_encoding = PositionalEncoding(max_len, embed_dim)
+        self.positional_encoding = PositionalEncoding(embed_dim)
 
         # Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_heads, dim_feedforward=embed_dim*4)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_heads, dim_feedforward=embed_dim * 4)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
         # Classification Head
@@ -144,10 +137,9 @@ class Net(nn.Module):
 
     def forward(self, x):
         # x: (B, C, H, W)
-        embeddings_list, positions_list = self.patch_embedding(x)
-        # Concatenate embeddings and positions from all scales
+        embeddings_list, _ = self.patch_embedding(x)
+        # Concatenate embeddings from all scales
         embeddings = torch.cat(embeddings_list, dim=1)  # (B, N_total, D)
-        # positions = torch.cat(positions_list, dim=0)    # (N_total, 2)  # Positions can be used if needed
 
         e_hat = self.gated_unit(embeddings)             # (B, N_total, D)
         e_tilde = self.aggregation_projection(e_hat)    # (B, N_total, D)
