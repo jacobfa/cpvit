@@ -108,8 +108,17 @@ class PositionalEncoding(nn.Module):
 
 
 class Net(nn.Module):
+    # def __init__(self, num_classes=10, in_channels=3, embed_dim=256,
+    #                 patch_sizes=[4, 8, 16], strides=None, n_heads=8, n_layers=6):
+    
     def __init__(self, num_classes=1000, in_channels=3, embed_dim=768,
                  patch_sizes=[4, 8, 16], strides=None, n_heads=12, n_layers=12):
+    
+    # def __init__(self, num_classes=1000, in_channels=3, embed_dim=1024,
+    #                 patch_sizes=[4, 8, 16], strides=None, n_heads=16, n_layers=24):
+        
+    # def __init__(self, num_classes=1000, in_channels=3, embed_dim=1280,
+    #                 patch_sizes=[4, 8, 16], strides=None, n_heads=16, n_layers=32):
         super(Net, self).__init__()
         self.embed_dim = embed_dim
         self.num_classes = num_classes
