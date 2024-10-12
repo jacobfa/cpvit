@@ -12,7 +12,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from model import Net  # Make sure this imports the updated model
+from model import Net  # Ensure this imports your actual model
 from torch.cuda.amp import autocast, GradScaler
 import torch.nn.utils
 
@@ -54,9 +54,9 @@ class AverageMeter:
 
     def reset(self):
         self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
+        self.avg = 0  # Average
+        self.sum = 0  # Sum of values
+        self.count = 0  # Number of updates
 
     def update(self, val, n=1):
         self.val = val
@@ -66,14 +66,14 @@ class AverageMeter:
 
 def accuracy(output, target, topk=(1,)):
     """
-    Computes the accuracy over the top-k predictions for the specified values of k.
+    Computes the accuracy over the top-k predictions for specified values of k.
     """
     with torch.no_grad():
         maxk = max(topk)
         batch_size = target.size(0)
 
         # Get top-k predictions
-        _, pred = output.topk(maxk, 1, True, True)  # Output: [batch_size, maxk]
+        _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()  # Shape: [maxk, batch_size]
         correct = pred.eq(target.view(1, -1).expand_as(pred))  # Shape: [maxk, batch_size]
 
@@ -126,7 +126,7 @@ def train_ddp(rank, world_size):
     output_dir = './output'
 
     # Ensure the output directory exists
-    if not os.path.exists(output_dir):
+    if rank == 0 and not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     # Model setup
@@ -150,24 +150,10 @@ def train_ddp(rank, world_size):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    transform_cifar = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomCrop(32, padding=4),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
-    
-    transform_cifar_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
 
     # Datasets
     train_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='train', transform=transform)
     val_dataset = datasets.ImageNet(root='/data/jacob/ImageNet/', split='val', transform=transform_test)
-    
-    # train_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=True, download=True, transform=transform_cifar)
-    # val_dataset = datasets.CIFAR10(root='/data/jacob/cifar10/', train=False, download=True, transform=transform_cifar_test)
 
     # Sampler and DataLoader
     train_sampler = DistributedSampler(train_dataset)
@@ -184,56 +170,92 @@ def train_ddp(rank, world_size):
     # Mixed Precision Scaler
     scaler = GradScaler()
 
-    # TensorBoard writer (only for rank 0 process)
+    # TensorBoard writer and log file (only for rank 0 process)
     if rank == 0:
         writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
-
-    if rank == 0:
         file = open(os.path.join(output_dir, "log.txt"), "w")
 
     # Training loop
     for epoch in range(num_epochs):
         model.train()
         train_sampler.set_epoch(epoch)
-        running_loss = 0.0
 
-        for i, (inputs, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", disable=(rank != 0))):
-            inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        # Initialize running loss and correct counts
+        running_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+
+        # Create tqdm iterator for rank 0
+        if rank == 0:
+            tqdm_loader = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", ncols=100)
+        else:
+            tqdm_loader = train_loader
+
+        for inputs, labels in tqdm_loader:
+            inputs = inputs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad()
 
-            # Add autocast for mixed precision
+            # Forward pass with autocast
             with autocast():
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
 
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
-            # Update weights
             scaler.step(optimizer)
             scaler.update()
+            optimizer.zero_grad()
 
-            running_loss += loss.item()
+            # Update running loss and counts
+            with torch.no_grad():
+                running_loss += loss.item() * inputs.size(0)
+                _, preds = outputs.topk(1, 1, True, True)
+                preds = preds.t()
+                correct = preds.eq(labels.view(1, -1).expand_as(preds))
+                total_correct += correct[:1].reshape(-1).float().sum(0).item()
+                total_samples += labels.size(0)
 
-        # Synchronize running_loss across all processes
-        total_loss = torch.tensor(running_loss, device=device)
-        dist.reduce(total_loss, dst=0, op=dist.ReduceOp.SUM)
-        average_loss = total_loss.item() / (len(train_loader) * world_size)
+            # Update progress bar
+            if rank == 0:
+                current_loss = running_loss / total_samples
+                current_acc = 100.0 * total_correct / total_samples
+                tqdm_loader.set_postfix({'Loss': f'{current_loss:.4f}', 'Acc': f'{current_acc:.2f}%'})
+
+        # After epoch, aggregate metrics
+        running_loss_tensor = torch.tensor(running_loss, device=device)
+        total_correct_tensor = torch.tensor(total_correct, device=device)
+        total_samples_tensor = torch.tensor(total_samples, device=device)
+
+        dist.reduce(running_loss_tensor, dst=0, op=dist.ReduceOp.SUM)
+        dist.reduce(total_correct_tensor, dst=0, op=dist.ReduceOp.SUM)
+        dist.reduce(total_samples_tensor, dst=0, op=dist.ReduceOp.SUM)
 
         if rank == 0:
-            logger.info(f"Epoch {epoch+1}, Loss: {average_loss}")
+            average_loss = running_loss_tensor.item() / total_samples_tensor.item()
+            average_acc = (total_correct_tensor.item() / total_samples_tensor.item()) * 100.0
+            logger.info(f"Epoch {epoch+1}, Loss: {average_loss:.4f}, Training Accuracy: {average_acc:.2f}%")
 
         # Validation
         accuracy1, accuracy5 = validate(model, val_loader, device)
 
-        # TensorBoard writer
+        # TensorBoard writer and log file
         if rank == 0:
             writer.add_scalar('Loss/train', average_loss, epoch+1)
+            writer.add_scalar('Accuracy/train_top1', average_acc, epoch+1)
             writer.add_scalar('Accuracy/val_top1', accuracy1, epoch+1)
             writer.add_scalar('Accuracy/val_top5', accuracy5, epoch+1)
-            logger.info(f"Epoch {epoch+1}, Loss: {average_loss}, Top-1 Accuracy: {accuracy1:.4f}%, Top-5 Accuracy: {accuracy5:.4f}%")
-            file.write(f"Epoch {epoch+1}, Loss: {average_loss}, Top-1 Accuracy: {accuracy1:.4f}%, Top-5 Accuracy: {accuracy5:.4f}%\n")
+            logger.info(f"Epoch {epoch+1}, Loss: {average_loss:.4f}, "
+                        f"Training Accuracy: {average_acc:.2f}%, Validation Top-1 Accuracy: {accuracy1:.2f}%, "
+                        f"Top-5 Accuracy: {accuracy5:.2f}%")
+            file.write(f"Epoch {epoch+1}, Loss: {average_loss:.4f}, "
+                       f"Training Accuracy: {average_acc:.2f}%, Validation Top-1 Accuracy: {accuracy1:.2f}%, "
+                       f"Top-5 Accuracy: {accuracy5:.2f}%\n")
             file.flush()
+
+            # Update tqdm description
+            tqdm_loader.set_description(f"Epoch {epoch+1}/{num_epochs} [Val Acc@1: {accuracy1:.2f}%]")
 
         # Save checkpoint every 2 epochs
         if rank == 0 and (epoch + 1) % 2 == 0:
@@ -250,7 +272,7 @@ def train_ddp(rank, world_size):
 # Main function
 def main():
     world_size = torch.cuda.device_count()
-    rank = int(os.environ['RANK'])  # rank should be set by distributed launcher
+    rank = int(os.environ['RANK'])  # Rank should be set by distributed launcher
     train_ddp(rank, world_size)
 
 if __name__ == "__main__":
