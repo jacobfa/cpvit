@@ -120,9 +120,9 @@ def train_ddp(rank, world_size):
     set_seed(42)  # Set a fixed seed for reproducibility
 
     # Set hyperparameters
-    batch_size = 4
+    batch_size = 64
     num_epochs = 350
-    learning_rate = 5e-3 / world_size
+    learning_rate = 1e-3
     output_dir = './output'
 
     # Ensure the output directory exists
@@ -204,6 +204,7 @@ def train_ddp(rank, world_size):
 
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
