@@ -4,13 +4,11 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchvision.models as models
 
-from torch_geometric.nn import global_mean_pool
+from torch_geometric.nn import GATConv, global_mean_pool
 from torch_geometric.data import Data, Batch
 from torch_geometric.nn import knn_graph
-from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.utils import softmax
 
-# Constants for ImageNet (Hyperparameters maintained)
+# Constants for ImageNet
 NUM_CLASSES = 1000
 IMAGE_SIZE = 224
 PATCH_SIZES = [16, 32]  # Multi-scale patches
@@ -22,6 +20,7 @@ DROPOUT = 0.1
 GRAPH_LAYER_DIM = 768
 GRAPH_HEADS = 8
 GRAPH_LAYERS = 3
+
 
 class MultiScalePatchEmbedding(nn.Module):
     def __init__(self, img_size, patch_sizes, in_chans, embed_dim):
@@ -63,78 +62,6 @@ class MultiScalePatchEmbedding(nn.Module):
             positions.append(pos)  # B x N_p x 2
         return patch_embeddings, positions
 
-class SinusoidalPositionalEmbedding(nn.Module):
-    def __init__(self, dim, max_len=10000):
-        super(SinusoidalPositionalEmbedding, self).__init__()
-        pe = torch.zeros(max_len, dim)
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-torch.log(torch.tensor(10000.0)) / dim))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)  # (max_len, dim)
-
-    def forward(self, positions):
-        # positions: (N, 2)
-        N = positions.size(0)
-        positions_flat = positions[:, 0] * 1000 + positions[:, 1]  # Simple flattening
-        positions_flat = positions_flat.long()
-        pe = self.pe[positions_flat]  # (N, dim)
-        return pe
-
-class HybridGATConv(MessagePassing):
-    def __init__(self, in_channels, out_channels, beta=0.1, dropout=DROPOUT):
-        super(HybridGATConv, self).__init__(aggr='add')  # 'add' aggregation
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-
-        self.dropout = nn.Dropout(dropout)
-
-        self.W = nn.Linear(in_channels, out_channels, bias=False)
-        nn.init.xavier_uniform_(self.W.weight)
-
-        self.a = nn.Parameter(torch.empty(2 * out_channels, 1))
-        nn.init.xavier_uniform_(self.a)
-
-        self.beta = nn.Parameter(torch.tensor(beta))
-
-        self.leaky_relu = nn.LeakyReLU(negative_slope=0.2)
-
-        # Layer Normalization after GNN
-        self.norm = nn.LayerNorm(out_channels)
-
-    def forward(self, x, edge_index):
-        # x has shape [N, in_channels]
-        x = self.W(x)  # [N, out_channels]
-
-        # Prepare index pointers for source and target nodes
-        row, col = edge_index  # edge_index has shape [2, E]
-
-        x_i = x[row]  # [E, out_channels]
-        x_j = x[col]  # [E, out_channels]
-
-        # Concatenate x_i and x_j
-        x_cat = torch.cat([x_i, x_j], dim=-1)  # [E, 2 * out_channels]
-
-        # Compute dot product
-        dot_product = (x_i * x_j).sum(dim=-1, keepdim=True)  # [E, 1]
-
-        # Compute e_{ij}
-        e_cat = torch.matmul(x_cat, self.a)  # [E, 1]
-        e_ij = self.leaky_relu(e_cat + self.beta * dot_product)  # [E, 1]
-
-        # Compute attention coefficients
-        alpha = softmax(e_ij, index=row)  # [E, 1]
-        alpha = self.dropout(alpha)
-
-        # Apply attention coefficients to node features in message passing
-        return self.propagate(edge_index, x=x, alpha=alpha)
-
-    def message(self, x_j, alpha):
-        return alpha * x_j  # Both have shape [E, out_channels]
-
-    def update(self, aggr_out):
-        # Apply layer normalization
-        return self.norm(aggr_out)
 
 class GraphAttentionNetwork(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, num_layers, heads):
@@ -144,18 +71,18 @@ class GraphAttentionNetwork(nn.Module):
 
         # First layer
         self.gat_layers.append(
-            HybridGATConv(in_dim, hidden_dim)
+            GATConv(in_dim, hidden_dim, heads=heads, concat=True, dropout=DROPOUT)
         )
 
         # Hidden layers
         for _ in range(num_layers - 2):
             self.gat_layers.append(
-                HybridGATConv(hidden_dim, hidden_dim)
+                GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, dropout=DROPOUT)
             )
 
         # Output layer
         self.gat_layers.append(
-            HybridGATConv(hidden_dim, out_dim)
+            GATConv(hidden_dim * heads, out_dim, heads=1, concat=False, dropout=DROPOUT)
         )
 
         self.out_dim = out_dim
@@ -167,9 +94,10 @@ class GraphAttentionNetwork(nn.Module):
         for i, gat_layer in enumerate(self.gat_layers):
             x = gat_layer(x, edge_index)
             if i != self.num_layers - 1:
-                x = F.relu(x)  # Use ReLU activation
+                x = F.relu(x)  # Use ReLU instead of ELU
         x = self.norm(x)  # Apply Layer Norm after GNN
         return x
+
 
 class GraphConditionedTransformerEncoderLayer(nn.Module):
     def __init__(self, embed_dim, num_heads, graph_dim):
@@ -204,6 +132,7 @@ class GraphConditionedTransformerEncoderLayer(nn.Module):
         src = self.norm2(src)
         return src
 
+
 class TransformerEncoder(nn.Module):
     def __init__(self, embed_dim, num_layers, num_heads, graph_dim):
         super(TransformerEncoder, self).__init__()
@@ -219,6 +148,7 @@ class TransformerEncoder(nn.Module):
             output = mod(output, graph_features, src_mask=src_mask, src_key_padding_mask=src_key_padding_mask)
         return output
 
+
 class ClassificationHead(nn.Module):
     def __init__(self, embed_dim, num_classes):
         super(ClassificationHead, self).__init__()
@@ -232,6 +162,7 @@ class ClassificationHead(nn.Module):
         x = self.linear(x)
         return x
 
+
 class Net(nn.Module):
     def __init__(self, num_classes=NUM_CLASSES, image_size=IMAGE_SIZE,
                  patch_sizes=PATCH_SIZES, in_chans=3, embed_dim=EMBED_DIM,
@@ -240,22 +171,6 @@ class Net(nn.Module):
         super(Net, self).__init__()
         self.embed_dim = embed_dim
         self.patch_embedding = MultiScalePatchEmbedding(image_size, patch_sizes, in_chans, embed_dim)
-
-        # Sinusoidal Positional Embedding
-        self.pos_emb = SinusoidalPositionalEmbedding(embed_dim)
-
-        # [CLS] token for Transformer
-        self.cls_token = nn.Parameter(torch.zeros(1, embed_dim))
-        nn.init.trunc_normal_(self.cls_token, std=.02)
-
-        # [CLS] token for GNN features
-        self.cls_token_gnn = nn.Parameter(torch.zeros(1, graph_layer_dim))
-        nn.init.trunc_normal_(self.cls_token_gnn, std=.02)
-
-        # Edge attention parameters for dynamic graph construction
-        self.edge_attention_a = nn.Parameter(torch.empty(2 * embed_dim, 1))
-        nn.init.xavier_uniform_(self.edge_attention_a)
-        self.edge_attention_beta = nn.Parameter(torch.tensor(0.1))  # initialize beta to 0.1
 
         # Graph Attention Network
         self.gnn = GraphAttentionNetwork(in_dim=embed_dim, hidden_dim=graph_layer_dim,
@@ -289,45 +204,13 @@ class Net(nn.Module):
             x_patches_i = torch.cat(x_patches_i, dim=0)  # N_i x D
             positions_i = torch.cat(positions_i, dim=0)  # N_i x 2
 
-            N_i = x_patches_i.size(0)
+            # Ensure positions_i is a FloatTensor
             positions_i = positions_i.float()
 
-            # Normalize positions to [0,1]
-            positions_i = positions_i / (positions_i.max() + 1e-6)
-
-            # Compute positional embeddings and add to patch embeddings
-            pos_embeds_i = self.pos_emb(positions_i)  # (N_i, D)
-            x_patches_i = x_patches_i + pos_embeds_i  # (N_i, D)
-
-            x_i = x_patches_i  # (N_i, D)
-
-            # Compute dot product similarities
-            dot_product = torch.matmul(x_i, x_i.T)  # (N_i, N_i)
-
-            # Expand x_i and x_j to (N_i * N_i, 2D)
-            x_i_expanded = x_i.unsqueeze(1).expand(-1, N_i, -1)  # (N_i, N_i, D)
-            x_j_expanded = x_i.unsqueeze(0).expand(N_i, -1, -1)  # (N_i, N_i, D)
-            x_cat = torch.cat([x_i_expanded, x_j_expanded], dim=-1)  # (N_i, N_i, 2D)
-            x_cat = x_cat.view(N_i * N_i, -1)  # (N_i * N_i, 2D)
-
-            # Compute e_{ij}
-            a = self.edge_attention_a  # (2D, 1)
-            e_cat = torch.matmul(x_cat, a).view(N_i, N_i)  # (N_i * N_i, 1) -> (N_i, N_i)
-            beta = self.edge_attention_beta  # scalar
-            e_ij = F.leaky_relu(e_cat + beta * dot_product)  # (N_i, N_i)
-
-            # Set diagonal elements (self-loops) to -inf to avoid selecting them
-            e_ij = e_ij.clone()
-            e_ij.fill_diagonal_(-float('inf'))
-
-            K = min(8, N_i - 1)  # Adjust K, ensure it's less than N_i
-            topk_values, topk_indices = torch.topk(e_ij, K, dim=1)  # (N_i, K)
-
-            # Build edge_index
-            row_indices = torch.arange(N_i, device=x.device).unsqueeze(1).expand(N_i, K).flatten()  # (N_i * K,)
-            col_indices = topk_indices.flatten()  # (N_i * K,)
-
-            edge_index = torch.stack([row_indices, col_indices], dim=0)  # (2, N_i * K)
+            # Build edge_index for sample i
+            # Build a k-NN graph based on positions_i
+            k = 8  # You can adjust k to control the sparsity
+            edge_index = knn_graph(positions_i, k=k, batch=None, loop=False)
 
             # Create Data object
             data = Data(x=x_patches_i, pos=positions_i, edge_index=edge_index)
@@ -345,26 +228,17 @@ class Net(nn.Module):
         # Prepare per-sample sequences for the transformer
         src_list = []
         graph_features_list = []
-        seq_lengths = []
+        max_seq_len = 0
         for i in range(B):
             mask = (batch_indices == i)
             src_i = batch.x[mask]  # N_i x D
             gnn_features_i = gnn_features[mask]  # N_i x D_g
 
-            # Add [CLS] token to src_i and gnn_features_i
-            cls_token_expanded = self.cls_token  # (1, D)
-            src_i = torch.cat([cls_token_expanded, src_i], dim=0)  # (N_i + 1, D)
-
-            cls_token_gnn_expanded = self.cls_token_gnn  # (1, D_g)
-            gnn_features_i = torch.cat([cls_token_gnn_expanded, gnn_features_i], dim=0)  # (N_i + 1, D_g)
-
             seq_len = src_i.size(0)
-            seq_lengths.append(seq_len)
+            max_seq_len = max(max_seq_len, seq_len)
 
             src_list.append(src_i)
             graph_features_list.append(gnn_features_i)
-
-        max_seq_len = max(seq_lengths)
 
         # Pad sequences to max length
         src_padded = torch.zeros(B, max_seq_len, self.embed_dim, device=x.device)
@@ -384,10 +258,14 @@ class Net(nn.Module):
         # Transformer Encoder
         output = self.transformer_encoder(src, graph_features, src_key_padding_mask=src_key_padding_mask)
 
-        # Classification Head using [CLS] token
+        # Classification Head
+        # Use global average pooling over unmasked positions
         output = output.transpose(0, 1)  # B x N x D
-        cls_output = output[:, 0, :]  # B x D
+        masked_output = output.masked_fill(src_key_padding_mask.unsqueeze(-1), 0)
+        lengths = (~src_key_padding_mask).sum(dim=1).unsqueeze(1)
+        lengths = lengths.clamp(min=1)  # Prevent division by zero
+        pooled_output = masked_output.sum(dim=1) / lengths.float()  # B x D
 
-        logits = self.classifier(cls_output)
+        logits = self.classifier(pooled_output)
 
         return logits
