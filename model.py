@@ -69,21 +69,14 @@ class GraphAttentionNetwork(nn.Module):
         self.gat_layers = nn.ModuleList()
         self.num_layers = num_layers
 
-        # First layer
-        self.gat_layers.append(
-            GATConv(in_dim, hidden_dim, heads=heads, concat=True, dropout=DROPOUT)
-        )
+        # Ensure consistent dimensions for residual connections
+        assert in_dim == hidden_dim == out_dim, "For residual connections, in_dim, hidden_dim, and out_dim must be equal"
 
-        # Hidden layers
-        for _ in range(num_layers - 2):
+        # GAT layers with residual connections
+        for _ in range(num_layers):
             self.gat_layers.append(
-                GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, dropout=DROPOUT)
+                GATConv(in_dim, in_dim, heads=heads, concat=False, dropout=DROPOUT)
             )
-
-        # Output layer
-        self.gat_layers.append(
-            GATConv(hidden_dim * heads, out_dim, heads=1, concat=False, dropout=DROPOUT)
-        )
 
         self.out_dim = out_dim
 
@@ -91,16 +84,17 @@ class GraphAttentionNetwork(nn.Module):
         self.norm = nn.LayerNorm(out_dim)
 
     def forward(self, x, edge_index):
-        for i, gat_layer in enumerate(self.gat_layers):
+        for gat_layer in self.gat_layers:
+            residual = x
             x = gat_layer(x, edge_index)
-            if i != self.num_layers - 1:
-                x = F.relu(x)  # Use ReLU instead of ELU
+            x = x + residual  # Residual connection
+            x = F.relu(x)
         x = self.norm(x)  # Apply Layer Norm after GNN
         return x
 
 
 class GraphConditionedTransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_dim, num_heads, graph_dim):
+    def __init__(self, embed_dim, num_heads, graph_dim, drop_path=0.0):
         super(GraphConditionedTransformerEncoderLayer, self).__init__()
         self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=DROPOUT)
         self.graph_proj = nn.Linear(graph_dim, embed_dim)
@@ -117,28 +111,44 @@ class GraphConditionedTransformerEncoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(embed_dim)
         self.activation = F.gelu
 
+        # LayerScale parameters
+        self.layer_scale_1 = nn.Parameter(torch.ones(embed_dim) * 0.1)
+        self.layer_scale_2 = nn.Parameter(torch.ones(embed_dim) * 0.1)
+
+        # Stochastic Depth (DropPath)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        # Removed relative positional encoding for now
+
     def forward(self, src, graph_features, src_mask=None, src_key_padding_mask=None):
-        # Graph-conditioned attention
+        # Pre-Layer Norm
+        src2 = self.norm1(src)
         graph_emb = self.graph_proj(graph_features)
-        q = k = src + graph_emb
-        src2, _ = self.self_attn(q, k, src, attn_mask=src_mask,
-                                 key_padding_mask=src_key_padding_mask)
-        src = src + self.dropout(src2)
-        src = self.norm1(src)
+        q = k = src2 + graph_emb
+        v = src2
+
+        # Multi-head Attention
+        attn_output, _ = self.self_attn(q, k, v, attn_mask=src_mask,
+                                        key_padding_mask=src_key_padding_mask)
+        # Apply LayerScale and DropPath
+        src = src + self.drop_path(self.layer_scale_1 * attn_output)
 
         # Feed-forward network
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + self.dropout(src2)
-        src = self.norm2(src)
+        src2 = self.norm2(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
+
+        # Apply LayerScale and DropPath
+        src = src + self.drop_path(self.layer_scale_2 * src2)
         return src
 
 
 class TransformerEncoder(nn.Module):
     def __init__(self, embed_dim, num_layers, num_heads, graph_dim):
         super(TransformerEncoder, self).__init__()
+        dpr = [x.item() for x in torch.linspace(0, 0.1, num_layers)]  # Stochastic depth decay rule
         self.layers = nn.ModuleList([
-            GraphConditionedTransformerEncoderLayer(embed_dim, num_heads, graph_dim)
-            for _ in range(num_layers)
+            GraphConditionedTransformerEncoderLayer(embed_dim, num_heads, graph_dim, drop_path=dpr[i])
+            for i in range(num_layers)
         ])
         self.num_layers = num_layers
 
@@ -163,6 +173,31 @@ class ClassificationHead(nn.Module):
         return x
 
 
+class DropPath(nn.Module):
+    """
+    DropPath class implements Stochastic Depth as per the original paper.
+
+    Reference: https://arxiv.org/abs/1603.09382
+    """
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return self.drop_path(x, self.drop_prob, self.training)
+
+    @staticmethod
+    def drop_path(x, drop_prob=0.0, training=False):
+        if drop_prob == 0.0 or not training:
+            return x
+        keep_prob = 1 - drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # Work with tensors of any dimensionality
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+        output = x.div(keep_prob) * random_tensor
+        return output
+
+
 class Net(nn.Module):
     def __init__(self, num_classes=NUM_CLASSES, image_size=IMAGE_SIZE,
                  patch_sizes=PATCH_SIZES, in_chans=3, embed_dim=EMBED_DIM,
@@ -171,6 +206,15 @@ class Net(nn.Module):
         super(Net, self).__init__()
         self.embed_dim = embed_dim
         self.patch_embedding = MultiScalePatchEmbedding(image_size, patch_sizes, in_chans, embed_dim)
+
+        # Class token
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+        # Positional embedding layer (absolute positional embeddings)
+        self.pos_embedding = nn.Linear(2, embed_dim)
+        nn.init.xavier_uniform_(self.pos_embedding.weight)
+        nn.init.zeros_(self.pos_embedding.bias)
 
         # Graph Attention Network
         self.gnn = GraphAttentionNetwork(in_dim=embed_dim, hidden_dim=graph_layer_dim,
@@ -233,6 +277,21 @@ class Net(nn.Module):
             mask = (batch_indices == i)
             src_i = batch.x[mask]  # N_i x D
             gnn_features_i = gnn_features[mask]  # N_i x D_g
+            positions_i = batch.pos[mask]  # N_i x 2
+
+            # Map positions to positional embeddings
+            pos_emb_i = self.pos_embedding(positions_i)  # N_i x D
+
+            # Add positional embeddings to src_i
+            src_i = src_i + pos_emb_i  # N_i x D
+
+            # Prepend cls_token
+            cls_token_expanded = self.cls_token.expand(1, -1, -1).squeeze(0)  # 1 x D
+            src_i = torch.cat([cls_token_expanded, src_i], dim=0)  # (N_i + 1) x D
+
+            # For graph_features, we initialize a zero cls token
+            graph_cls_token = torch.zeros(1, self.gnn.out_dim, device=x.device)  # 1 x D_g
+            gnn_features_i = torch.cat([graph_cls_token, gnn_features_i], dim=0)  # (N_i + 1) x D_g
 
             seq_len = src_i.size(0)
             max_seq_len = max(max_seq_len, seq_len)
@@ -259,13 +318,10 @@ class Net(nn.Module):
         output = self.transformer_encoder(src, graph_features, src_key_padding_mask=src_key_padding_mask)
 
         # Classification Head
-        # Use global average pooling over unmasked positions
+        # Use the output corresponding to the cls_token
         output = output.transpose(0, 1)  # B x N x D
-        masked_output = output.masked_fill(src_key_padding_mask.unsqueeze(-1), 0)
-        lengths = (~src_key_padding_mask).sum(dim=1).unsqueeze(1)
-        lengths = lengths.clamp(min=1)  # Prevent division by zero
-        pooled_output = masked_output.sum(dim=1) / lengths.float()  # B x D
+        cls_output = output[:, 0, :]  # B x D
 
-        logits = self.classifier(pooled_output)
+        logits = self.classifier(cls_output)
 
         return logits
